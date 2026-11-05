@@ -3,7 +3,7 @@ import discord
 from discord import app_commands
 from discord.ext import commands, tasks
 from dotenv import load_dotenv
-from cards import (make_card, make_banner, make_leaderboard,
+from cards import (make_card, make_banner, make_leaderboard, make_quote,
                    GOLD, ORANGE, GREEN, RED_LIGHT)
 
 load_dotenv()
@@ -295,11 +295,8 @@ async def open_ticket_channel(guild, sub, handler):
     author = guild.get_member(sub["author_id"])
     if author:
         overwrites[author] = P(**base)
-    role_ids = [cfg.get("staff_role_id")]  # главная роль видит все тикеты, остальные роли нет
-    for rid in role_ids:
-        role = guild.get_role(rid or 0)
-        if role:
-            overwrites[role] = P(**base)
+    # Тикет виден только взявшему, автору и администраторам сервера. Роли персонала его не видят,
+    # пока их не отметят в тикете (см. on_message).
     category = guild.get_channel(cfg.get("ticket_category_id", 0))
     return await guild.create_text_channel(
         name=f"{KINDS[sub['kind']]['prefix']}-{sub['num']:04d}", category=category, overwrites=overwrites,
@@ -515,6 +512,9 @@ class SubmissionView(discord.ui.View):
         db.execute("UPDATE subs SET ticket_msg_id=? WHERE id=?", (msg.id, sub["id"]))
         db.commit()
         await refresh_message(sub["id"])
+        link = discord.ui.View()
+        link.add_item(discord.ui.Button(label="Открыть тикет", emoji="📂", url=channel.jump_url))
+        await i.followup.send(f"Ты взял в работу: {channel.mention}", view=link, ephemeral=True)
 
     @discord.ui.button(label="Принять", emoji="✅", style=discord.ButtonStyle.success, custom_id="sub:ok")
     async def ok(self, i: discord.Interaction, b: discord.ui.Button):
@@ -832,6 +832,73 @@ async def weekly_post(i: discord.Interaction):
     await i.followup.send("Отчёт отправлен в канал статистики.", ephemeral=True)
 
 
+# ====== ЦИТАТЫ ======
+QUOTE_HOOK = "Цитаты"
+NO_MENTIONS = discord.AllowedMentions.none()
+
+
+def quote_names(user):
+    """(имя для шапки, подпись под цитатой): «ник | юзернейм»."""
+    same = user.display_name == user.name
+    return (user.name if same else f"{user.display_name} | {user.name}",
+            f"@{user.name}" if same else f"@{user.display_name} | {user.name}")
+
+
+async def post_quote(channel, user, text, signature=None, style="cream"):
+    """Рисует цитату и отправляет от имени автора (вебхук). Без права на вебхуки - обычным сообщением."""
+    try:
+        avatar = await user.display_avatar.replace(size=256, format="png").read()
+    except discord.HTTPException:
+        avatar = None
+    name, handle = quote_names(user)
+    buf = await asyncio.to_thread(make_quote, text, signature or handle, avatar, style)
+    is_thread = isinstance(channel, discord.Thread)
+    target = channel.parent if is_thread else channel
+    msg = None
+    try:
+        hooks = await target.webhooks()
+        hook = (discord.utils.find(lambda h: h.name == QUOTE_HOOK and h.token, hooks)
+                or await target.create_webhook(name=QUOTE_HOOK))
+        kw = {"thread": channel} if is_thread else {}
+        msg = await hook.send(file=discord.File(buf, "quote.png"), username=name[:80],
+                              avatar_url=user.display_avatar.url, allowed_mentions=NO_MENTIONS, wait=True, **kw)
+    except discord.HTTPException:
+        buf.seek(0)
+        msg = await channel.send(content=f"**{name}**", file=discord.File(buf, "quote.png"),
+                                 allowed_mentions=NO_MENTIONS)
+    try:
+        await msg.add_reaction("❤️")
+    except discord.HTTPException:
+        pass
+
+
+STYLE_CHOICES = [app_commands.Choice(name="Светлая (как в примерах)", value="cream"),
+                 app_commands.Choice(name="Тёмная (красно-золотая)", value="dark")]
+
+
+@bot.tree.command(name="quote", description="Оформить цитату картинкой")
+@app_commands.describe(text="Текст цитаты", user="Чья цитата (по умолчанию - ты)",
+                       signature="Своя подпись вместо @ника", style="Оформление")
+@app_commands.choices(style=STYLE_CHOICES)
+@app_commands.guild_only()
+async def quote(i: discord.Interaction, text: app_commands.Range[str, 1, 400],
+                user: discord.Member | None = None, signature: app_commands.Range[str, 1, 50] | None = None,
+                style: app_commands.Choice[str] | None = None):
+    await i.response.defer(ephemeral=True)
+    await post_quote(i.channel, user or i.user, text, signature, style.value if style else "cream")
+    await i.followup.send("Цитата отправлена.", ephemeral=True)
+
+
+@bot.tree.context_menu(name="Цитата")
+@app_commands.guild_only()
+async def quote_message(i: discord.Interaction, message: discord.Message):
+    if not message.clean_content.strip():
+        return await i.response.send_message("В сообщении нет текста.", ephemeral=True)
+    await i.response.defer(ephemeral=True)
+    await post_quote(i.channel, message.author, message.clean_content[:400])
+    await i.followup.send("Цитата отправлена.", ephemeral=True)
+
+
 @bot.event
 async def on_message(message: discord.Message):
     """Если сотрудник в тикете отметил (@) человека, тикет открывается и для него."""
@@ -861,4 +928,5 @@ async def on_ready():
     print(f"Вошёл как {bot.user}")
 
 
-bot.run(os.environ["DISCORD_TOKEN"])
+if __name__ == "__main__":
+    bot.run(os.environ["DISCORD_TOKEN"])
