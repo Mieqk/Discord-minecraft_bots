@@ -48,19 +48,29 @@ def test_reapply_after_reject_and_admin_exempt(store):
     assert run(b.validate_submission(fake_interaction(admin=True), "app", APP, cfg)) is None
 
 
-def test_nick_checks(store, monkeypatch):
-    async def exists(nick):
-        return nick != "Ghost"
-    monkeypatch.setattr(b.mojang, "exists", exists)
+def test_nick_checks(store):
     cfg = {}
     ask = lambda nick, uid=10: run(b.validate_submission(fake_interaction(uid), "app", {**APP, "nick": nick}, cfg))
     assert ask("Steve") is None
     assert "3-16" in ask("п")
-    assert "нет в Minecraft" in ask("Ghost")
     store.create_sub(1, "app", 11, "t", {**APP, "nick": "Steve"})
     assert "уже указан" in ask("steve")
-    monkeypatch.setattr(b.mojang, "exists", lambda n: asyncio.sleep(0, result=None))  # Mojang недоступен
-    assert ask("Alex") is None                                                         # заявку не блокируем
+
+
+def test_mojang_is_only_a_note(store, monkeypatch):
+    """Ника нет у Mojang - заявку не отклоняем (пиратки), а помечаем."""
+    values = {**APP, "nick": "Propley"}
+    for answer, expected in ((True, "found"), (False, "missing"), (None, None)):
+        monkeypatch.setattr(b.mojang, "exists", lambda n, a=answer: asyncio.sleep(0, result=a))
+        assert run(b.mojang_note(values, {})) == expected
+        assert run(b.validate_submission(fake_interaction(), "app", values, {})) is None  # не блокирует
+    assert run(b.mojang_note(values, {"mc_check": False})) is None
+
+
+def test_mojang_note_shown_on_card():
+    assert b.mojang_field({"_mojang": "missing"})[0][1].startswith("⚠️")
+    assert b.mojang_field({"_mojang": "found"})[0][1].startswith("✅")
+    assert b.mojang_field({}) == []
 
 
 def test_mojang_status_mapping():
