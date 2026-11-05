@@ -6,6 +6,7 @@ from discord import app_commands
 from discord.ext import commands
 
 import store
+import errsink
 from store import gcfg
 from kinds import KINDS
 
@@ -22,6 +23,9 @@ def setup_logging():
               RotatingFileHandler(os.path.join(folder, "bot.log"), maxBytes=1_000_000, backupCount=3, encoding="utf-8")):
         h.setFormatter(fmt)
         root.addHandler(h)
+    sink = errsink.SinkHandler()  # ошибки уходят ещё и в канал логов (jobs.flush_errors)
+    sink.setFormatter(fmt)
+    root.addHandler(sink)
 
 
 # ====== ПРАВА ======

@@ -4,3 +4,5 @@ __pycache__/
 fonts/
 data/
 .pytest_cache/
+/data.db
+/config.json

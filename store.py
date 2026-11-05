@@ -73,12 +73,17 @@ def init(directory=None, legacy_dir=None):
     _ensure_column("subs", "num", "INTEGER")
     _ensure_column("subs", "priority", "INTEGER DEFAULT 0")
     _ensure_column("subs", "transcript", "TEXT")
+    _ensure_column("subs", "last_human_id", "INTEGER")
+    _ensure_column("subs", "last_human_ts", "INTEGER")
+    db.execute("CREATE INDEX IF NOT EXISTS idx_subs_ticket ON subs(ticket_channel_id)")
     db.execute("UPDATE subs SET num=(SELECT COUNT(*) FROM subs s2 WHERE s2.guild_id=subs.guild_id "
                "AND s2.kind=subs.kind AND s2.id<=subs.id) WHERE num IS NULL")
     db.execute("CREATE TABLE IF NOT EXISTS guild_cfg(guild_id INTEGER PRIMARY KEY, data TEXT NOT NULL)")
     db.execute("""CREATE TABLE IF NOT EXISTS quotes(
         id INTEGER PRIMARY KEY AUTOINCREMENT, guild_id INTEGER, channel_id INTEGER, message_id INTEGER UNIQUE,
         author_id INTEGER, text TEXT, signature TEXT, style TEXT, created_ts INTEGER)""")
+    db.execute("CREATE TABLE IF NOT EXISTS blocked(guild_id INTEGER, user_id INTEGER, reason TEXT, by_id INTEGER, "
+               "ts INTEGER, PRIMARY KEY(guild_id, user_id))")
     db.execute("CREATE TABLE IF NOT EXISTS quote_favs(user_id INTEGER, quote_id INTEGER, PRIMARY KEY(user_id, quote_id))")
     db.commit()
     _migrate_config(legacy_dir or d)
@@ -219,6 +224,35 @@ def open_queue(gid, kinds=None, urgent_only=False, limit=15):
         q += " AND priority=1"
     q += " ORDER BY priority DESC, created_ts ASC LIMIT ?"
     return db.execute(q, args + [limit]).fetchall()
+
+
+def touch_human(channel_id, user_id, ts):
+    """Запоминаем, кто последним (не бот) написал в тикете: от этого зависит, кого напоминать."""
+    cur = db.execute("UPDATE subs SET last_human_id=?, last_human_ts=? WHERE ticket_channel_id=? AND status='work'",
+                     (user_id, ts, channel_id))
+    if cur.rowcount:  # на каждое сообщение сервера коммит не нужен
+        db.commit()
+
+
+# ====== ЧЁРНЫЙ СПИСОК ======
+def block_user(gid, uid, reason, by_id):
+    db.execute("INSERT OR REPLACE INTO blocked(guild_id,user_id,reason,by_id,ts) VALUES(?,?,?,?,?)",
+               (gid, uid, reason, by_id, now()))
+    db.commit()
+
+
+def unblock_user(gid, uid):
+    cur = db.execute("DELETE FROM blocked WHERE guild_id=? AND user_id=?", (gid, uid))
+    db.commit()
+    return cur.rowcount > 0
+
+
+def blocked_row(gid, uid):
+    return db.execute("SELECT * FROM blocked WHERE guild_id=? AND user_id=?", (gid, uid)).fetchone()
+
+
+def blocked_list(gid, limit=25):
+    return db.execute("SELECT * FROM blocked WHERE guild_id=? ORDER BY ts DESC LIMIT ?", (gid, limit)).fetchall()
 
 
 # ====== СТАТИСТИКА ======

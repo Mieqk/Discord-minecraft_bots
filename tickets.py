@@ -3,6 +3,7 @@ import io, json, asyncio
 import discord
 
 import store
+import rcon
 from store import db, gcfg, now, fmt_dur, make_nick, sub_by_id
 from kinds import KINDS, PARA
 from cards import make_card, GOLD, ORANGE, GREEN, RED_LIGHT
@@ -184,6 +185,17 @@ async def set_nickname(sub):
     return f"\nНик на сервере: `{new}`"
 
 
+async def whitelist_note(sub):
+    """Добавляет принятого игрока в вайтлист сервера (RCON, если настроен). Возвращает примечание для персонала."""
+    if not gcfg(sub["guild_id"]).get("whitelist", True):
+        return ""
+    res = await rcon.whitelist_add(json.loads(sub["fields"]).get("nick", "").strip())
+    if res is None:
+        return ""
+    ok, text = res
+    return f"\nВайтлист: {'добавлен' if ok else 'НЕ добавлен'} - {text}"
+
+
 async def lock_ticket(sub):
     """Сразу закрываем тикет: писать туда больше никто не может."""
     ch = bot.get_channel(sub["ticket_channel_id"]) if sub["ticket_channel_id"] else None
@@ -222,7 +234,7 @@ def transcript_file(sub, text):
     return discord.File(io.BytesIO(text.encode("utf-8")), transcript_name(sub)) if text is not None else None
 
 
-async def send_log(sub, nick_note, dur, transcript):
+async def send_log(sub, nick_note, dur, transcript, wl_note=""):
     """Лог закрытого обращения: заявка + переписка одним сообщением в канал логов."""
     cfg = gcfg(sub["guild_id"])
     ch = bot.get_channel(cfg.get("log_channel_id", 0)) or bot.get_channel(sub["channel_id"])
@@ -239,6 +251,8 @@ async def send_log(sub, nick_note, dur, transcript):
         e.add_field(name="Причина", value=sub["reason"][:1024], inline=False)
     if nick_note.strip():
         e.add_field(name="Ник", value=nick_note.strip(), inline=False)
+    if wl_note.strip():
+        e.add_field(name="Вайтлист", value=wl_note.strip(), inline=False)
     file = transcript_file(sub, transcript)
     await ch.send(embed=e, file=file) if file else await ch.send(embed=e)
 
@@ -253,6 +267,7 @@ async def finish(sid, status, handler_id, reason=None):
     k, ok = KINDS[sub["kind"]], status == "approved"
     dur = fmt_dur(sub["closed_ts"] - sub["created_ts"])
     nick_note = await set_nickname(sub) if ok and sub["kind"] == "app" else ""
+    wl_note = await whitelist_note(sub) if ok and sub["kind"] == "app" else ""
     try:
         await lock_ticket(sub)  # сначала закрыть, потом собирать переписку
     except Exception:
@@ -261,7 +276,7 @@ async def finish(sid, status, handler_id, reason=None):
         transcript = await collect_transcript(sub)
         if transcript is not None:
             store.save_transcript(sid, transcript)  # копия в базе: /ticket покажет её, даже когда канал удалён
-        await send_log(sub, nick_note, dur, transcript)
+        await send_log(sub, nick_note, dur, transcript, wl_note)
     except Exception:
         log.exception("send_log")
     if ok:
@@ -270,7 +285,7 @@ async def finish(sid, status, handler_id, reason=None):
         text, color = "Статус: **отклонено** ❌" + (f"\nПричина: {reason}" if reason else ""), RED_LIGHT
     await notify_author(sub, text, color)
     return (f"{'✅' if ok else '❌'} {k['label']} #{sub['num']}: {k['done'].lower() if ok else 'отклонена'}. "
-            f"Время обработки: {dur}.{nick_note}")
+            f"Время обработки: {dur}.{nick_note}{wl_note}")
 
 
 # ====== КНОПКИ ПОД ЗАЯВКОЙ ======

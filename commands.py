@@ -4,6 +4,7 @@ import discord
 from discord import app_commands
 
 import store
+import rcon
 from store import db, gcfg, set_gcfg, now, fmt_dur
 from kinds import KINDS, KIND_CHOICES
 from cards import make_banner, GOLD
@@ -49,19 +50,67 @@ async def setup_roles(i: discord.Interaction, staff_role: discord.Role, app_role
 
 @bot.tree.command(name="settings", description="Дополнительные настройки (только администраторы сервера)")
 @app_commands.describe(mc_check="Проверять ник Minecraft в заявках (формат, дубли; пометка, если нет у Mojang)",
-                       reapply_days="Через сколько дней можно подать заявку после отказа (0 - без ограничения)")
+                       reapply_days="Через сколько дней можно подать заявку после отказа (0 - без ограничения)",
+                       auto_close_days="Закрывать обращение, если игрок молчит столько дней (0 - не закрывать)",
+                       backup_discord="Присылать суточную копию базы в канал логов",
+                       error_log="Присылать ошибки бота в канал логов",
+                       whitelist="Добавлять принятых игроков в вайтлист сервера по RCON (если RCON настроен)")
 @app_commands.guild_only()
 @app_commands.checks.has_permissions(administrator=True)
 async def settings(i: discord.Interaction, mc_check: bool | None = None,
-                   reapply_days: app_commands.Range[int, 0, 365] | None = None):
-    if mc_check is not None:
-        set_gcfg(i.guild.id, mc_check=mc_check)
-    if reapply_days is not None:
-        set_gcfg(i.guild.id, reapply_days=reapply_days)
+                   reapply_days: app_commands.Range[int, 0, 365] | None = None,
+                   auto_close_days: app_commands.Range[int, 0, 60] | None = None,
+                   backup_discord: bool | None = None, error_log: bool | None = None,
+                   whitelist: bool | None = None):
+    changes = {k: v for k, v in dict(mc_check=mc_check, reapply_days=reapply_days, auto_close_days=auto_close_days,
+                                     backup_discord=backup_discord, error_log=error_log, whitelist=whitelist).items()
+               if v is not None}
+    if changes:
+        set_gcfg(i.guild.id, **changes)
     cfg = gcfg(i.guild.id)
+    on = lambda v: "вкл" if v else "выкл"
+    days = cfg.get("auto_close_days", 0)
     await i.response.send_message(
-        f"Проверка ника Minecraft: **{'вкл' if cfg.get('mc_check', True) else 'выкл'}**\n"
-        f"Повторная заявка после отказа: **{cfg.get('reapply_days', REAPPLY_DAYS)} дн.**", ephemeral=True)
+        f"Проверка ника Minecraft: **{on(cfg.get('mc_check', True))}**\n"
+        f"Повторная заявка после отказа: **{cfg.get('reapply_days', REAPPLY_DAYS)} дн.**\n"
+        f"Автозакрытие при молчании игрока: **{str(days) + ' дн.' if days else 'выкл'}**\n"
+        f"Копия базы в канал логов: **{on(cfg.get('backup_discord', False))}**\n"
+        f"Ошибки бота в канал логов: **{on(cfg.get('error_log', True))}**\n"
+        f"Вайтлист по RCON: **{on(cfg.get('whitelist', True))}** "
+        f"({'RCON настроен' if rcon.config() else 'RCON не настроен на хосте'})", ephemeral=True)
+
+
+@bot.tree.command(name="block", description="Закрыть игроку подачу заявок в проект (админка)")
+@app_commands.describe(user="Кому закрыть", reason="Причина (видна только персоналу)")
+@app_commands.guild_only()
+@team_only()
+async def block(i: discord.Interaction, user: discord.User, reason: app_commands.Range[str, 0, 200] = ""):
+    store.block_user(i.guild.id, user.id, reason, i.user.id)
+    await i.response.send_message(f"{user.mention} больше не может подавать заявки в проект.", ephemeral=True,
+                                  allowed_mentions=discord.AllowedMentions.none())
+
+
+@bot.tree.command(name="unblock", description="Снять запрет на подачу заявок (админка)")
+@app_commands.describe(user="С кого снять")
+@app_commands.guild_only()
+@team_only()
+async def unblock(i: discord.Interaction, user: discord.User):
+    done = store.unblock_user(i.guild.id, user.id)
+    await i.response.send_message(f"{user.mention}: запрет снят." if done else f"{user.mention} не был в списке.",
+                                  ephemeral=True, allowed_mentions=discord.AllowedMentions.none())
+
+
+@bot.tree.command(name="blocked", description="Кому закрыта подача заявок (админка)")
+@app_commands.guild_only()
+@team_only()
+async def blocked(i: discord.Interaction):
+    rows = store.blocked_list(i.guild.id)
+    if not rows:
+        return await i.response.send_message("Список пуст.", ephemeral=True)
+    lines = [f"<@{r['user_id']}> - {r['reason'] or 'без причины'} (<@{r['by_id']}>, <t:{r['ts']}:d>)" for r in rows]
+    await i.response.send_message(embed=discord.Embed(title="Закрыта подача заявок", description="\n".join(lines),
+                                                      color=discord.Color.from_rgb(*GOLD)), ephemeral=True,
+                                  allowed_mentions=discord.AllowedMentions.none())
 
 
 async def send_panel(i: discord.Interaction, kind: str):
@@ -261,7 +310,10 @@ async def health(i: discord.Interaction):
 @bot.event
 async def on_message(message: discord.Message):
     """Если сотрудник в тикете отметил (@) человека, тикет открывается и для него."""
-    if message.author.bot or not message.guild or not (message.mentions or message.role_mentions):
+    if message.author.bot or not message.guild:
+        return
+    store.touch_human(message.channel.id, message.author.id, int(message.created_at.timestamp()))
+    if not (message.mentions or message.role_mentions):
         return
     sub = db.execute("SELECT * FROM subs WHERE ticket_channel_id=? AND status='work'",
                      (message.channel.id,)).fetchone()

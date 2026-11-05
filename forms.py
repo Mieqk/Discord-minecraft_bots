@@ -16,6 +16,8 @@ REAPPLY_DAYS = 3                # через сколько дней можно 
 async def validate_submission(i, kind, values, cfg):
     """Возвращает текст ошибки или None, если обращение можно создавать."""
     k = KINDS[kind]
+    if kind == "app" and store.blocked_row(i.guild.id, i.user.id):
+        return "Подача заявок для тебя закрыта администрацией."
     if kind == "app" and not values["age"].isdigit():
         return "Возраст нужно указать числом."
     if store.active_count(i.guild.id, i.user.id, kind) >= k["max_active"]:

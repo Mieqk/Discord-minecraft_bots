@@ -1,11 +1,13 @@
 """Фоновые задачи: напоминания, уборка тикетов, недельный отчёт, резервные копии."""
-import datetime
+import os, datetime
 import discord
 from discord.ext import tasks
 
 import store
 from store import db, gcfg, set_gcfg, now
+import errsink
 from core import bot, log, ping_role
+from policy import silence_action
 from stats import post_weekly
 
 REMIND_AFTER = 24 * 3600        # через сколько без ответа тегать вайтлистеров
@@ -13,26 +15,34 @@ CLEANUP_AFTER = 3600            # через сколько после реше�
 
 
 async def remind_handlers():
-    """Заявка в работе, а в тикете тихо больше суток: пингуем в самом тикете того, кто её взял.
+    """Тикет в работе тихий больше суток: напоминаем тому, кого ждём (взявшему или игроку),
+    а если включено /settings auto_close_days, то закрываем обращение, когда игрок долго молчит.
     Сообщение бота тоже считается последним, поэтому повтор будет не чаще раза в сутки."""
+    from tickets import finish
     rows = db.execute("SELECT * FROM subs WHERE status='work' AND ticket_channel_id IS NOT NULL "
                       "AND handler_id IS NOT NULL").fetchall()
     for sub in rows:
         ch = bot.get_channel(sub["ticket_channel_id"])
         if not ch:
             continue
-        last = (discord.utils.snowflake_time(ch.last_message_id).timestamp()
-                if ch.last_message_id else sub["created_ts"])
-        if now() - last < REMIND_AFTER:
-            continue
+        days = gcfg(sub["guild_id"]).get("auto_close_days", 0)
+        last_any = (discord.utils.snowflake_time(ch.last_message_id).timestamp()
+                    if ch.last_message_id else sub["created_ts"])
+        action = silence_action(sub["last_human_id"], sub["author_id"], last_any, sub["last_human_ts"],
+                                now(), REMIND_AFTER, days * 86400)
         try:
-            await ch.send(f"<@{sub['handler_id']}>, по обращению **#{sub['num']}** тихо больше суток. "
-                          f"Ответь игроку или закрой обращение.")
+            if action == "close":
+                await finish(sub["id"], "rejected", sub["handler_id"], f"Нет ответа от игрока {days} дн.")
+            elif action == "ping_player":
+                tail = f" Если ответа не будет, обращение закроют через {days} дн." if days else ""
+                await ch.send(f"<@{sub['author_id']}>, по обращению **#{sub['num']}** ждём твой ответ.{tail}")
+            elif action == "ping_handler":
+                await ch.send(f"<@{sub['handler_id']}>, по обращению **#{sub['num']}** тихо больше суток. "
+                              f"Ответь игроку или закрой обращение.")
         except discord.HTTPException:
             log.exception("remind_handlers")
 
 
-# ====== ФОНОВЫЕ ЗАДАЧИ ======
 async def remind_unanswered():
     """Обращение так никто и не взял сутки: ещё раз тегаем роль-обработчика под карточкой."""
     rows = db.execute("SELECT * FROM subs WHERE status='new' AND pinged=0 AND created_ts<?",
@@ -75,15 +85,46 @@ async def weekly_check():
             await post_weekly(guild)
 
 
+MAX_BACKUP_UPLOAD = 8 * 1024 * 1024  # больше не отправляем, чтобы не упереться в лимит вложений
+
+
 async def daily_backup():
     path = store.backup_db()
-    if path:
-        log.info("Резервная копия базы: %s", path)
+    if not path:
+        return
+    log.info("Резервная копия базы: %s", path)
+    if os.path.getsize(path) > MAX_BACKUP_UPLOAD:
+        log.warning("Копия слишком большая для отправки в Discord")
+        return
+    for guild in bot.guilds:  # копия вне хоста: в закрытый канал логов, если включено /settings backup_discord
+        cfg = gcfg(guild.id)
+        ch = bot.get_channel(cfg.get("log_channel_id", 0))
+        if ch and cfg.get("backup_discord"):
+            try:
+                await ch.send("🗄️ Резервная копия базы", file=discord.File(path))
+            except discord.HTTPException:
+                log.warning("Не удалось отправить копию в канал логов", exc_info=True)
+
+
+async def flush_errors():
+    """Ошибки бота из bot.log дублируются в канал логов (выключается /settings error_log)."""
+    texts = errsink.drain()
+    if not texts:
+        return
+    for guild in bot.guilds:
+        cfg = gcfg(guild.id)
+        ch = bot.get_channel(cfg.get("log_channel_id", 0))
+        if ch and cfg.get("error_log", True):
+            for text in texts:
+                try:
+                    await ch.send(f"⚠️ Ошибка бота:\n```\n{text}\n```", allowed_mentions=discord.AllowedMentions.none())
+                except discord.HTTPException:
+                    log.warning("Не удалось отправить ошибку в канал логов", exc_info=True)
 
 
 @tasks.loop(minutes=5)
 async def background():
-    for job in (remind_unanswered, remind_handlers, cleanup_tickets, weekly_check, daily_backup):
+    for job in (remind_unanswered, remind_handlers, cleanup_tickets, weekly_check, daily_backup, flush_errors):
         try:
             await job()
         except Exception:
