@@ -915,6 +915,31 @@ async def ticket(i: discord.Interaction, kind: app_commands.Choice[str], number:
         await i.response.send_message(embed=e, ephemeral=True)
 
 
+def roles_with_access(channel):
+    """Роли (кроме @everyone и ботов), которые видят канал, и почему: [(роль, причина)]."""
+    out = []
+    for role in channel.guild.roles:
+        if role.is_default() or role.managed:
+            continue
+        perms = channel.permissions_for(role)
+        if perms.view_channel:
+            out.append((role, "право «Администратор»" if perms.administrator else "право на просмотр каналов"))
+    return out
+
+
+@bot.tree.command(name="access", description="Кто видит этот канал: роли и причина (админка, вызывать в тикете)")
+@app_commands.guild_only()
+@team_only()
+async def access(i: discord.Interaction):
+    rows = roles_with_access(i.channel)
+    lines = [f"{r.mention} - {why}" for r, why in rows] or ["Ни одна роль не видит этот канал."]
+    e = discord.Embed(title="Кто видит этот канал", description="\n".join(lines),
+                      color=discord.Color.from_rgb(*GOLD))
+    e.set_footer(text="Роли с правом «Администратор» видят все каналы, Discord этого не скрывает. "
+                      "Чтобы канал был скрыт от роли, уберите у неё это право.")
+    await i.response.send_message(embed=e, ephemeral=True, allowed_mentions=discord.AllowedMentions.none())
+
+
 def rss_mb():
     try:
         with open("/proc/self/status") as f:

@@ -45,3 +45,21 @@ def test_missing_token_message(monkeypatch, tmp_path):
     monkeypatch.setattr(b, "setup_logging", lambda: None)
     with pytest.raises(SystemExit, match="DISCORD_TOKEN"):
         b.main()
+
+
+def test_roles_with_access_reports_reason():
+    import discord
+    import bot as b
+
+    class Role:
+        def __init__(self, name, default=False, managed=False):
+            self.name, self._d, self.managed = name, default, managed
+        def is_default(self):
+            return self._d
+
+    admin, helper, nobody, robot, everyone = Role("admin"), Role("helper"), Role("nobody"), Role("bot", managed=True), Role("@everyone", default=True)
+    perms = {admin: discord.Permissions.all(), helper: discord.Permissions(view_channel=True),
+             nobody: discord.Permissions.none(), robot: discord.Permissions.all(), everyone: discord.Permissions.none()}
+    channel = type("C", (), {"guild": type("G", (), {"roles": list(perms)})(), "permissions_for": lambda self, r: perms[r]})()
+    got = {r.name: why for r, why in b.roles_with_access(channel)}
+    assert got == {"admin": "право «Администратор»", "helper": "право на просмотр каналов"}
