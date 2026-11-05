@@ -151,6 +151,7 @@ class Bot(commands.Bot):
         intents = discord.Intents.default()
         intents.members = True
         super().__init__(command_prefix="!", intents=intents,
+                         max_messages=None,  # кэш сообщений не нужен
                          allowed_mentions=discord.AllowedMentions(roles=False, everyone=False, users=True, replied_user=False))
 
     async def setup_hook(self):
