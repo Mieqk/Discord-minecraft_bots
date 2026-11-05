@@ -150,3 +150,63 @@ def make_leaderboard(title, rows, summary=""):
         d.text((W - 80 - d.textlength(right, font=font(20)), y + 14), right, font=font(20), fill=GOLD if i == 1 else GREY)
         y += 62
     return to_buf(img)
+
+
+# ====== ЦИТАТЫ ======
+REGULAR_CANDIDATES = [
+    "fonts/regular.ttf",
+    "DejaVuSans.ttf",
+    "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+    "arial.ttf",
+]
+PEACH_TOP = (255, 214, 168)
+PEACH_BOTTOM = (255, 249, 242)
+INK = (45, 28, 22)
+BROWN = (140, 98, 62)
+ORANGE_SOFT = (235, 170, 110)
+
+
+def font_regular(size):
+    for p in REGULAR_CANDIDATES:
+        try:
+            return ImageFont.truetype(p, size)
+        except OSError:
+            continue
+    return font(size)
+
+
+def make_quote(text, handle, avatar=None, style="cream"):
+    """Цитата: аватар слева, крупный текст, тонкая линия и подпись.
+    style="cream" - как в примерах (светлый градиент), style="dark" - палитра проекта."""
+    text = " ".join(text.split())[:400]
+    tf = font_regular(44) if style == "cream" else font(40)
+    probe = ImageDraw.Draw(Image.new("RGB", (W, 10)))
+    x = 230
+    lines = wrap(probe, text, tf, W - x - 60, 6)
+    h = max(240, 90 + len(lines) * 58 + 100)
+
+    if style == "dark":
+        img = base(h)
+        ink, sub, mark = WHITE, GREY, GOLD
+    else:
+        grad = Image.linear_gradient("L").resize((W, h))
+        img = Image.composite(Image.new("RGB", (W, h), PEACH_BOTTOM), Image.new("RGB", (W, h), PEACH_TOP), grad).convert("RGBA")
+        ink, sub, mark = INK, BROWN, ORANGE_SOFT
+
+    d = ImageDraw.Draw(img)
+    if avatar:
+        av = circle_avatar(avatar, 130)
+        ay = (h - 130) // 2
+        img.paste(av, (60, ay), av)
+        if style == "dark":
+            d.ellipse((57, ay - 3, 193, ay + 133), outline=GOLD, width=2)
+    d.text((x - 6, 24), "“", font=font(60), fill=mark)
+
+    y = 76
+    for line in lines:
+        d.text((x, y), line, font=tf, fill=ink)
+        y += 58
+    d.line((x, h - 74, x + 44, h - 74), fill=mark, width=2)
+    sf = font_regular(24)
+    d.text((x, h - 62), handle[:50], font=sf, fill=sub)
+    return to_buf(img)
