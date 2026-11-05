@@ -147,6 +147,15 @@ def discord_fields(uid, user):
     return [("Discord", who, True), ("Аккаунт создан", f"<t:{ts}:D> (<t:{ts}:R>)", True)]
 
 
+def mojang_field(values):
+    mj = values.get("_mojang")
+    if mj == "missing":
+        return [("Ник в Mojang", "⚠️ не найден (возможно, без лицензии)", True)]
+    if mj == "found":
+        return [("Ник в Mojang", "✅ найден", True)]
+    return []
+
+
 def brief_fields(sub, user):
     """Коротко: ник в дискорде, дата создания аккаунта + пара ключевых полей."""
     values = json.loads(sub["fields"])
@@ -154,7 +163,7 @@ def brief_fields(sub, user):
     for key, name in KINDS[sub["kind"]]["brief"]:
         if values.get(key):
             out.append((name, values[key][:200], True))
-    return out
+    return out + mojang_field(values)
 
 
 def full_embed(sub, user):
@@ -166,6 +175,8 @@ def full_embed(sub, user):
     for key, label, *_ in k["fields"]:
         if values.get(key):
             e.add_field(name=label, value=values[key][:1024], inline=False)
+    for name, val, inline in mojang_field(values):
+        e.add_field(name=name, value=val, inline=inline)
     return e
 
 
@@ -538,9 +549,15 @@ async def validate_submission(i, kind, values, cfg):
             return "Ник Minecraft: 3-16 символов, латиница, цифры и «_»."
         if store.nick_taken(i.guild.id, nick, i.user.id):
             return "Этот ник уже указан в другой заявке."
-        if await mojang.exists(nick) is False:
-            return f"Игрока **{nick}** нет в Minecraft (Java). Проверь, как пишется ник."
     return None
+
+
+async def mojang_note(values, cfg):
+    """Мягкая проверка: 'found' / 'missing' / None (не проверяли или Mojang недоступен). Заявку не блокирует:
+    на сервере бывают игроки без лицензии, решает вайтлистер."""
+    if not cfg.get("mc_check", True):
+        return None
+    return {True: "found", False: "missing"}.get(await mojang.exists(values["nick"].strip()))
 
 
 class FormModal(discord.ui.Modal):
@@ -563,6 +580,10 @@ class FormModal(discord.ui.Modal):
         if err:
             return await i.followup.send(err, ephemeral=True)
 
+        if self.kind == "app":
+            note = await mojang_note(values, cfg)
+            if note:
+                values["_mojang"] = note
         topic = k["topic"](values, i.user)[:200]
         sid = store.create_sub(i.guild.id, self.kind, i.user.id, topic, values)
         sub = sub_by_id(sid)
@@ -760,7 +781,7 @@ async def setup_roles(i: discord.Interaction, staff_role: discord.Role, app_role
 
 
 @bot.tree.command(name="settings", description="Дополнительные настройки (только администраторы сервера)")
-@app_commands.describe(mc_check="Проверять ник Minecraft в заявках (формат, дубли, существование у Mojang)",
+@app_commands.describe(mc_check="Проверять ник Minecraft в заявках (формат, дубли; пометка, если нет у Mojang)",
                        reapply_days="Через сколько дней можно подать заявку после отказа (0 - без ограничения)")
 @app_commands.guild_only()
 @app_commands.checks.has_permissions(administrator=True)
