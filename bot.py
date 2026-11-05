@@ -84,6 +84,7 @@ class Bot(commands.Bot):
     def __init__(self):
         intents = discord.Intents.default()
         intents.members = True
+        intents.message_content = True  # нужен для текста переписки в логах (включить в Developer Portal)
         super().__init__(command_prefix="!", intents=intents,
                          max_messages=None,  # кэш сообщений не нужен
                          chunk_guilds_at_startup=False,  # не качать всех участников при старте (см. get_member)

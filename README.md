@@ -2,7 +2,7 @@
 
 ## Запуск
 1. https://discord.com/developers/applications → New Application → Bot → скопируй токен.
-   Включи **Server Members Intent**. Пригласи бота со скоупами `bot` + `applications.commands`
+   Включи **Server Members Intent** и **Message Content Intent** (второй нужен, чтобы в логах была переписка тикета). Пригласи бота со скоупами `bot` + `applications.commands`
    и правами: Send Messages, Embed Links, Attach Files, Read Message History, View Channel.
 2. `pip install -r requirements.txt`
 3. Скопируй `.env.example` в `.env`, вставь токен.
