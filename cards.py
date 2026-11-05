@@ -1,5 +1,7 @@
 """Карточки в палитре: чёрный фон, красные тени, золотые тонкие акценты."""
 import io
+import threading
+from functools import lru_cache, wraps
 from PIL import Image, ImageDraw, ImageFont, ImageFilter
 
 W = 900
@@ -21,6 +23,19 @@ FONT_CANDIDATES = [
 ]
 
 
+_render_lock = threading.Lock()
+
+
+def serialized(fn):
+    """Шрифты из кэша общие, а FreeType не потокобезопасен: рисуем по одной картинке за раз."""
+    @wraps(fn)
+    def wrapper(*a, **kw):
+        with _render_lock:
+            return fn(*a, **kw)
+    return wrapper
+
+
+@lru_cache(maxsize=None)
 def font(size):
     for p in FONT_CANDIDATES:
         try:
@@ -31,7 +46,14 @@ def font(size):
 
 
 def base(h, glow=(-120, None)):
+    """Копия кэшированного фона (градиент, свечение и уголки считаются один раз)."""
+    return _base(h, glow[0]).copy()
+
+
+@lru_cache(maxsize=32)
+def _base(h, glow_x):
     """Чёрный фон, внизу тёмно-красный градиент, красное свечение, золотые уголки."""
+    glow = (glow_x, None)
     grad = Image.linear_gradient("L").resize((W, h))
     img = Image.composite(Image.new("RGB", (W, h), DARK_RED), Image.new("RGB", (W, h), BLACK), grad).convert("RGBA")
 
@@ -82,6 +104,7 @@ def to_buf(img):
     return buf
 
 
+@serialized
 def make_card(label, title, status, status_color, author, avatar=None, footer=""):
     """Карточка заявки: тема крупно, статус плашкой."""
     h = 300
@@ -113,6 +136,7 @@ def make_card(label, title, status, status_color, author, avatar=None, footer=""
     return to_buf(img)
 
 
+@serialized
 def make_banner(title, subtitle=""):
     """Баннер для панели."""
     h = 260
@@ -128,6 +152,7 @@ def make_banner(title, subtitle=""):
     return to_buf(img)
 
 
+@serialized
 def make_leaderboard(title, rows, summary=""):
     """rows: [(имя, всего обработано, одобрено, среднее время текстом)]"""
     rows = rows[:8]
@@ -166,6 +191,7 @@ BROWN = (140, 98, 62)
 ORANGE_SOFT = (235, 170, 110)
 
 
+@lru_cache(maxsize=None)
 def font_regular(size):
     for p in REGULAR_CANDIDATES:
         try:
@@ -175,6 +201,7 @@ def font_regular(size):
     return font(size)
 
 
+@serialized
 def make_quote(text, handle, avatar=None, style="cream"):
     """Цитата: аватар слева, крупный текст, тонкая линия и подпись.
     style="cream" - как в примерах (светлый градиент), style="dark" - палитра проекта."""
