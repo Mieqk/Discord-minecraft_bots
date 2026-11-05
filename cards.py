@@ -2,7 +2,7 @@
 import io
 import threading
 from functools import lru_cache, wraps
-from PIL import Image, ImageDraw, ImageFont, ImageFilter
+from PIL import Image, ImageDraw, ImageFont, ImageFilter, ImageOps
 
 W = 900
 BLACK = (10, 10, 12)
@@ -202,9 +202,10 @@ def font_regular(size):
 
 
 @serialized
-def make_quote(text, handle, avatar=None, style="cream"):
+def make_quote(text, handle, avatar=None, style="cream", background=None):
     """Цитата: аватар слева, крупный текст, тонкая линия и подпись.
-    style="cream" - как в примерах (светлый градиент), style="dark" - палитра проекта."""
+    style="cream" - как в примерах (светлый градиент), style="dark" - палитра проекта.
+    background - байты картинки: ложится фоном с затемнением (как в примере с драконом)."""
     text = " ".join(text.split())[:400]
     tf = font_regular(44) if style == "cream" else font(40)
     probe = ImageDraw.Draw(Image.new("RGB", (W, 10)))
@@ -212,7 +213,17 @@ def make_quote(text, handle, avatar=None, style="cream"):
     lines = wrap(probe, text, tf, W - x - 60, 6)
     h = max(240, 90 + len(lines) * 58 + 100)
 
-    if style == "dark":
+    bg = None
+    if background:
+        try:
+            bg = ImageOps.fit(Image.open(io.BytesIO(background)).convert("RGB"), (W, h), Image.LANCZOS).convert("RGBA")
+        except Exception:
+            bg = None  # битая картинка - рисуем без неё
+    if bg is not None:
+        shade = Image.new("RGBA", (W, h), (0, 0, 0, 150))
+        img = Image.alpha_composite(bg, shade)
+        ink, sub, mark = WHITE, (215, 205, 195), GOLD
+    elif style == "dark":
         img = base(h)
         ink, sub, mark = WHITE, GREY, GOLD
     else:
@@ -225,7 +236,7 @@ def make_quote(text, handle, avatar=None, style="cream"):
         av = circle_avatar(avatar, 130)
         ay = (h - 130) // 2
         img.paste(av, (60, ay), av)
-        if style == "dark":
+        if style == "dark" or bg is not None:
             d.ellipse((57, ay - 3, 193, ay + 133), outline=GOLD, width=2)
     d.text((x - 6, 24), "“", font=font(60), fill=mark)
 

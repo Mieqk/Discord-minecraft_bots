@@ -1,117 +1,38 @@
-import os, io, json, time, asyncio, sqlite3, datetime, traceback
+import os, io, json, time, asyncio, datetime, logging, platform
+from logging.handlers import RotatingFileHandler
 import discord
 from discord import app_commands
 from discord.ext import commands, tasks
 from dotenv import load_dotenv
-from cards import (make_card, make_banner, make_leaderboard, make_quote,
+
+import store
+import mojang
+from store import db, gcfg, set_gcfg, now, fmt_dur, make_nick, sub_by_id
+from kinds import KINDS, KIND_CHOICES, PARA
+from quotes import Quotes
+from cards import (make_card, make_banner, make_leaderboard,
                    GOLD, ORANGE, GREEN, RED_LIGHT)
 
 load_dotenv()
-CONFIG_FILE = "config.json"
+log = logging.getLogger("bot")
+
 REMIND_AFTER = 24 * 3600        # через сколько без ответа тегать вайтлистеров
 CLEANUP_AFTER = 3600            # через сколько после решения удалять канал тикета
 NICK_FROM_USERNAME = True       # True: ник из юзернейма (carburadiator), False: из отображаемого имени
-TEXT, PARA = discord.TextStyle.short, discord.TextStyle.paragraph
-
-# ====== ВИДЫ ОБРАЩЕНИЙ ======
-# fields: (ключ, вопрос в форме, стиль, обязательное, макс. длина)
-# brief: что показывать КОРОТКО до взятия в работу: (ключ, подпись)
-KINDS = {
-    "app": {
-        "label": "Заявка в проект", "emoji": "📝", "btn": "Подать заявку", "style": discord.ButtonStyle.success,
-        "desc": "Хочешь попасть на проект? Ответь на пять вопросов - вайтлистеры рассмотрят заявку.",
-        "fields": [("age", "Сколько вам лет?", TEXT, True, 3),
-                   ("rp", "Ваш уровень РП (1/10)", TEXT, True, 10),
-                   ("source", "Откуда узнали о нас?", TEXT, True, 200),
-                   ("goal", "Расскажите о цели на проекте", PARA, True, 1000),
-                   ("nick", "Ваш ник майкрафт", TEXT, True, 32)],
-        "brief": [("age", "Возраст")],
-        "topic": lambda v, u: f"Заявка • {u.display_name}",
-        "ok_btn": "Принять", "done": "Принята", "max_active": 1, "role_key": "app_role_id", "prefix": "ticket", "acc": "заявку", "section": "Заявка в проект",
-    },
-    "report": {
-        "label": "Жалоба", "emoji": "⚠️", "btn": "Написать жалобу", "style": discord.ButtonStyle.danger,
-        "desc": "Есть жалоба на игрока, сервер или администрацию? Кратко назови тему и подробно опиши проблему.",
-        "fields": [("topic", "На что жалоба (коротко)", TEXT, True, 100),
-                   ("details", "Подробное описание", PARA, True, 1500)],
-        "brief": [],
-        "topic": lambda v, u: v["topic"],
-        "ok_btn": "Решено", "done": "Решена", "max_active": 3, "role_key": "report_role_id", "prefix": "report", "acc": "жалобу", "section": "Жалобы",
-    },
-    "bug": {
-        "label": "Баг", "emoji": "🐞", "btn": "Сообщить о баге", "style": discord.ButtonStyle.secondary,
-        "desc": "Что-то сломалось на сервере или в боте? Расскажи, мы исправим.",
-        "fields": [("topic", "Что сломалось (коротко)", TEXT, True, 100),
-                   ("details", "Описание бага", PARA, True, 1500),
-                   ("steps", "Как повторить (необязательно)", PARA, False, 800)],
-        "brief": [],
-        "topic": lambda v, u: v["topic"],
-        "ok_btn": "Исправлено", "done": "Исправлен", "max_active": 3, "role_key": "bug_role_id", "prefix": "bug", "acc": "баг", "section": "Баги",
-    },
-}
-KIND_CHOICES = [app_commands.Choice(name=k["section"], value=key) for key, k in KINDS.items()]
+SPAM_LIMIT, SPAM_WINDOW = 5, 3600   # не больше 5 обращений в час от одного человека
+REAPPLY_DAYS = 3                # через сколько дней можно подать заявку после отказа (/settings reapply_days)
 
 
-# ====== КОНФИГ ======
-def load_cfg():
-    if os.path.exists(CONFIG_FILE):
-        with open(CONFIG_FILE, encoding="utf-8") as f:
-            return json.load(f)
-    return {}
-
-
-def gcfg(gid):
-    return load_cfg().get(str(gid), {})
-
-
-def set_gcfg(gid, **kw):
-    cfg = load_cfg()
-    cfg.setdefault(str(gid), {}).update(kw)
-    with open(CONFIG_FILE, "w", encoding="utf-8") as f:
-        json.dump(cfg, f, ensure_ascii=False, indent=2)
-
-
-# ====== БАЗА ======
-db = sqlite3.connect("data.db")
-db.row_factory = sqlite3.Row
-db.execute("""CREATE TABLE IF NOT EXISTS subs(
-    id INTEGER PRIMARY KEY AUTOINCREMENT, guild_id INTEGER, kind TEXT, author_id INTEGER,
-    topic TEXT, fields TEXT, status TEXT DEFAULT 'new', handler_id INTEGER, reason TEXT,
-    channel_id INTEGER, message_id INTEGER, ticket_channel_id INTEGER, ticket_msg_id INTEGER,
-    created_ts INTEGER, closed_ts INTEGER, pinged INTEGER DEFAULT 0, num INTEGER)""")
-if "num" not in [r["name"] for r in db.execute("PRAGMA table_info(subs)")]:
-    db.execute("ALTER TABLE subs ADD COLUMN num INTEGER")
-db.execute("UPDATE subs SET num=(SELECT COUNT(*) FROM subs s2 WHERE s2.guild_id=subs.guild_id "
-           "AND s2.kind=subs.kind AND s2.id<=subs.id) WHERE num IS NULL")
-db.commit()
-
-
-def now():
-    return int(time.time())
-
-
-def sub_by_id(sid):
-    return db.execute("SELECT * FROM subs WHERE id=?", (sid,)).fetchone()
-
-
-def find_sub(i):
-    """Заявку находим по сообщению-карточке или по каналу тикета."""
-    return (db.execute("SELECT * FROM subs WHERE message_id=?", (i.message.id,)).fetchone()
-            or db.execute("SELECT * FROM subs WHERE ticket_channel_id=?", (i.channel.id,)).fetchone())
-
-
-def fmt_dur(sec):
-    if sec is None:
-        return "-"
-    sec = int(sec)
-    d, r = divmod(sec, 86400)
-    h, r = divmod(r, 3600)
-    m = r // 60
-    if d:
-        return f"{d} д {h} ч"
-    if h:
-        return f"{h} ч {m} мин"
-    return f"{max(m, 1)} мин"
+def setup_logging():
+    folder = os.path.join(store.data_dir(), "logs")
+    os.makedirs(folder, exist_ok=True)
+    fmt = logging.Formatter("%(asctime)s %(levelname)s %(name)s: %(message)s")
+    root = logging.getLogger()
+    root.setLevel(logging.INFO)
+    for h in (logging.StreamHandler(),
+              RotatingFileHandler(os.path.join(folder, "bot.log"), maxBytes=1_000_000, backupCount=3, encoding="utf-8")):
+        h.setFormatter(fmt)
+        root.addHandler(h)
 
 
 # ====== ПРАВА ======
@@ -137,11 +58,24 @@ def can_handle(member, cfg, kind):
     return role is not None and role in member.roles
 
 
+def handled_kinds(member, cfg):
+    return [key for key in KINDS if can_handle(member, cfg, key)]
+
+
 def team_only():
     async def pred(i: discord.Interaction):
         if i.guild and is_team(i.user, gcfg(i.guild.id)):
             return True
         raise app_commands.CheckFailure("Эта команда только для администрации.")
+    return app_commands.check(pred)
+
+
+def staff_only():
+    """Администрация или любая из ролей-обработчиков."""
+    async def pred(i: discord.Interaction):
+        if i.guild and handled_kinds(i.user, gcfg(i.guild.id)):
+            return True
+        raise app_commands.CheckFailure("Эта команда только для персонала.")
     return app_commands.check(pred)
 
 
@@ -152,11 +86,14 @@ class Bot(commands.Bot):
         intents.members = True
         super().__init__(command_prefix="!", intents=intents,
                          max_messages=None,  # кэш сообщений не нужен
+                         chunk_guilds_at_startup=False,  # не качать всех участников при старте (см. get_member)
                          allowed_mentions=discord.AllowedMentions(roles=False, everyone=False, users=True, replied_user=False))
+        self.started_ts = time.time()
 
     async def setup_hook(self):
         self.add_view(PanelView(list(KINDS)))
         self.add_view(SubmissionView())
+        await self.add_cog(Quotes(self))
         await self.tree.sync()
         background.start()
 
@@ -171,7 +108,7 @@ async def on_app_error(i: discord.Interaction, error: app_commands.AppCommandErr
     elif isinstance(error, app_commands.CheckFailure):
         msg = str(error) or "Нет доступа."
     else:
-        traceback.print_exception(type(error), error, error.__traceback__)
+        log.error("Ошибка команды", exc_info=(type(error), error, error.__traceback__))
         msg = "Что-то пошло не так, попробуй ещё раз."
     if i.response.is_done():
         await i.followup.send(msg, ephemeral=True)
@@ -182,6 +119,17 @@ async def on_app_error(i: discord.Interaction, error: app_commands.AppCommandErr
 async def get_user(uid):
     try:
         return bot.get_user(uid) or await bot.fetch_user(uid)
+    except discord.HTTPException:
+        return None
+
+
+async def get_member(guild, uid):
+    """Участник из кэша, а если его там нет (список участников мы не грузим целиком) - запросом к Discord."""
+    member = guild.get_member(uid)
+    if member:
+        return member
+    try:
+        return await guild.fetch_member(uid)
     except discord.HTTPException:
         return None
 
@@ -221,6 +169,19 @@ def full_embed(sub, user):
     return e
 
 
+def details_embed(sub, user):
+    """Что видит персонал по кнопке «Подробнее» и в /ticket: до взятия в работу только кратко."""
+    if sub["status"] != "new":
+        return full_embed(sub, user)
+    k = KINDS[sub["kind"]]
+    e = discord.Embed(title=f"{k['emoji']} {k['label']} #{sub['num']}", description=f"**{sub['topic']}**\n\n"
+                      "Полные ответы откроются, когда возьмёшь заявку в работу.",
+                      color=discord.Color.from_rgb(*GOLD))
+    for n, v, inline in brief_fields(sub, user):
+        e.add_field(name=n, value=v, inline=inline)
+    return e
+
+
 async def render(sub):
     k = KINDS[sub["kind"]]
     text, color = status_info(sub)
@@ -232,13 +193,16 @@ async def render(sub):
             avatar = await user.display_avatar.replace(size=256, format="png").read()
         except discord.HTTPException:
             pass
-    buf = await asyncio.to_thread(make_card, k["label"], sub["topic"], text, color, name, avatar, f"#{sub['num']}")
+    label = k["label"] + (" • срочно" if sub["priority"] else "")
+    buf = await asyncio.to_thread(make_card, label, sub["topic"], text, color, name, avatar, f"#{sub['num']}")
     file = discord.File(buf, "card.png")
 
     e = discord.Embed(color=discord.Color.from_rgb(*color))
     for n, v, inline in brief_fields(sub, user):
         e.add_field(name=n, value=v, inline=inline)
     e.add_field(name="Статус", value=text)
+    if sub["priority"]:
+        e.add_field(name="Приоритет", value="🔥 Срочно")
     if sub["handler_id"]:
         e.add_field(name="Обрабатывает" if sub["status"] == "work" else "Обработал", value=f"<@{sub['handler_id']}>")
     if sub["status"] == "work" and sub["ticket_channel_id"]:
@@ -250,7 +214,7 @@ async def render(sub):
     e.set_image(url="attachment://card.png")
     e.set_footer(text="Полные ответы откроются после «Взять в работу»" if sub["status"] == "new"
                  else "Нажми «Подробнее», чтобы прочитать полностью")
-    return e, file, SubmissionView(sub["kind"], sub["status"])
+    return e, file, SubmissionView(sub["kind"], sub["status"], sub["priority"])
 
 
 async def refresh_message(sid):
@@ -261,13 +225,13 @@ async def refresh_message(sid):
         e, f, v = await render(sub)
         await msg.edit(embed=e, attachments=[f], view=v)
     except discord.HTTPException:
-        traceback.print_exc()
+        log.exception("Не удалось обновить карточку #%s", sub["num"])
     if sub["ticket_channel_id"] and sub["ticket_msg_id"]:
         try:
             tch = bot.get_channel(sub["ticket_channel_id"])
             if tch:
                 tm = await tch.fetch_message(sub["ticket_msg_id"])
-                await tm.edit(view=SubmissionView(sub["kind"], sub["status"]))
+                await tm.edit(view=SubmissionView(sub["kind"], sub["status"], sub["priority"]))
         except discord.HTTPException:
             pass
 
@@ -293,30 +257,21 @@ async def open_ticket_channel(guild, sub, handler):
         guild.me: P(**base, embed_links=True, manage_channels=True),
         handler: P(**base),
     }
-    author = guild.get_member(sub["author_id"])
-    if author:
-        overwrites[author] = P(**base)
     # Тикет виден только взявшему, автору и администраторам сервера. Роли персонала его не видят,
     # пока их не отметят в тикете (см. on_message).
+    author = await get_member(guild, sub["author_id"])
+    if author:
+        overwrites[author] = P(**base)
     category = guild.get_channel(cfg.get("ticket_category_id", 0))
     return await guild.create_text_channel(
         name=f"{KINDS[sub['kind']]['prefix']}-{sub['num']:04d}", category=category, overwrites=overwrites,
         topic=f"{KINDS[sub['kind']]['label']} #{sub['num']} • {sub['topic']}")
 
 
-def make_nick(dname, mc):
-    """Формат: ник дискорда // ник майнкрафта (без @), максимум 32 символа."""
-    sep = " // "
-    mc = mc.replace("@", "").strip()
-    mc = mc[:32 - len(sep) - 1]
-    room = 32 - len(sep) - len(mc)
-    return f"{dname.strip()[:room]}{sep}{mc}"
-
-
 async def set_nickname(sub):
     """Меняет ник игрока на сервере после принятия заявки, возвращает текст-примечание."""
     guild = bot.get_guild(sub["guild_id"])
-    member = guild.get_member(sub["author_id"]) if guild else None
+    member = await get_member(guild, sub["author_id"]) if guild else None
     if not member:
         return "\nИгрок не на сервере, ник не менялся."
     mc = json.loads(sub["fields"]).get("nick", "")
@@ -354,10 +309,15 @@ async def lock_ticket(sub):
         try:
             await ch.set_permissions(target, overwrite=ow)
         except discord.HTTPException:
-            traceback.print_exc()
+            log.exception("Не удалось закрыть тикет %s", ch.id)
 
 
-async def transcript_file(sub):
+def transcript_name(sub):
+    return f"{KINDS[sub['kind']]['prefix']}-{sub['num']:04d}.txt"
+
+
+async def collect_transcript(sub):
+    """Текст переписки тикета (без сообщений бота) или None, если канала нет."""
     ch = bot.get_channel(sub["ticket_channel_id"]) if sub["ticket_channel_id"] else None
     if not ch:
         return None
@@ -367,11 +327,14 @@ async def transcript_file(sub):
             continue
         files = " ".join(a.url for a in m.attachments)
         lines.append(f"[{m.created_at:%Y-%m-%d %H:%M} UTC] {m.author.display_name}: {m.clean_content} {files}".strip())
-    data = io.BytesIO(("\n".join(lines) or "(сообщений нет)").encode("utf-8"))
-    return discord.File(data, f"{KINDS[sub['kind']]['prefix']}-{sub['num']:04d}.txt")
+    return "\n".join(lines) or "(сообщений нет)"
 
 
-async def send_log(sub, nick_note, dur):
+def transcript_file(sub, text):
+    return discord.File(io.BytesIO(text.encode("utf-8")), transcript_name(sub)) if text is not None else None
+
+
+async def send_log(sub, nick_note, dur, transcript):
     """Лог закрытого обращения: заявка + переписка одним сообщением в канал логов."""
     cfg = gcfg(sub["guild_id"])
     ch = bot.get_channel(cfg.get("log_channel_id", 0)) or bot.get_channel(sub["channel_id"])
@@ -388,7 +351,7 @@ async def send_log(sub, nick_note, dur):
         e.add_field(name="Причина", value=sub["reason"][:1024], inline=False)
     if nick_note.strip():
         e.add_field(name="Ник", value=nick_note.strip(), inline=False)
-    file = await transcript_file(sub)
+    file = transcript_file(sub, transcript)
     await ch.send(embed=e, file=file) if file else await ch.send(embed=e)
 
 
@@ -402,11 +365,17 @@ async def finish(sid, status, handler_id, reason=None):
     k, ok = KINDS[sub["kind"]], status == "approved"
     dur = fmt_dur(sub["closed_ts"] - sub["created_ts"])
     nick_note = await set_nickname(sub) if ok and sub["kind"] == "app" else ""
-    for job in (lock_ticket(sub), send_log(sub, nick_note, dur)):  # сначала закрыть, потом лог с перепиской
-        try:
-            await job
-        except Exception:
-            traceback.print_exc()
+    try:
+        await lock_ticket(sub)  # сначала закрыть, потом собирать переписку
+    except Exception:
+        log.exception("lock_ticket")
+    try:
+        transcript = await collect_transcript(sub)
+        if transcript is not None:
+            store.save_transcript(sid, transcript)  # копия в базе: /ticket покажет её, даже когда канал удалён
+        await send_log(sub, nick_note, dur, transcript)
+    except Exception:
+        log.exception("send_log")
     if ok:
         text, color = f"Статус: **{k['done']}** ✅", GREEN
     else:
@@ -417,6 +386,12 @@ async def finish(sid, status, handler_id, reason=None):
 
 
 # ====== КНОПКИ ПОД ЗАЯВКОЙ ======
+def find_sub(i):
+    """Заявку находим по сообщению-карточке или по каналу тикета."""
+    return (db.execute("SELECT * FROM subs WHERE message_id=?", (i.message.id,)).fetchone()
+            or db.execute("SELECT * FROM subs WHERE ticket_channel_id=?", (i.channel.id,)).fetchone())
+
+
 def check_handle(i, sub):
     if not can_handle(i.user, gcfg(i.guild.id), sub["kind"]):
         return "Нет доступа."
@@ -450,12 +425,14 @@ class ReasonModal(discord.ui.Modal, title="Отклонить"):
 
 
 class SubmissionView(discord.ui.View):
-    def __init__(self, kind=None, status="new"):
+    def __init__(self, kind=None, status="new", priority=0):
         super().__init__(timeout=None)
         if kind:
             self.ok.label = KINDS[kind]["ok_btn"]
+        if priority:
+            self.prio.label = "Снять срочность"
         if status in ("approved", "rejected"):
-            self.take.disabled = self.ok.disabled = self.no.disabled = True
+            self.take.disabled = self.ok.disabled = self.no.disabled = self.prio.disabled = True
         elif status == "work":
             self.take.disabled = True
 
@@ -467,16 +444,7 @@ class SubmissionView(discord.ui.View):
         if not can_handle(i.user, gcfg(i.guild.id), sub["kind"]):
             return await i.response.send_message("Нет доступа.", ephemeral=True)
         user = await get_user(sub["author_id"])
-        if sub["status"] == "new":
-            k = KINDS[sub["kind"]]
-            e = discord.Embed(title=f"{k['emoji']} {k['label']} #{sub['num']}", description=f"**{sub['topic']}**\n\n"
-                              "Полные ответы откроются, когда возьмёшь заявку в работу.",
-                              color=discord.Color.from_rgb(*GOLD))
-            for n, v, inline in brief_fields(sub, user):
-                e.add_field(name=n, value=v, inline=inline)
-        else:
-            e = full_embed(sub, user)
-        await i.response.send_message(embed=e, ephemeral=True)
+        await i.response.send_message(embed=details_embed(sub, user), ephemeral=True)
 
     @discord.ui.button(label="Взять в работу", emoji="🛠️", style=discord.ButtonStyle.primary, custom_id="sub:take")
     async def take(self, i: discord.Interaction, b: discord.ui.Button):
@@ -498,7 +466,7 @@ class SubmissionView(discord.ui.View):
         try:
             channel = await open_ticket_channel(i.guild, sub, i.user)
         except discord.HTTPException:
-            traceback.print_exc()
+            log.exception("Не удалось создать канал тикета")
             db.execute("UPDATE subs SET status='new', handler_id=NULL WHERE id=?", (sub["id"],))
             db.commit()
             return await i.followup.send("Не смог создать канал тикета. Дай боту право «Управлять каналами» "
@@ -509,7 +477,7 @@ class SubmissionView(discord.ui.View):
         author = await get_user(sub["author_id"])
         msg = await channel.send(
             content=f"<@{sub['author_id']}>, {KINDS[sub['kind']]['acc']} взял в работу {i.user.mention}",
-            embed=full_embed(sub, author), view=SubmissionView(sub["kind"], "work"))
+            embed=full_embed(sub, author), view=SubmissionView(sub["kind"], "work", sub["priority"]))
         db.execute("UPDATE subs SET ticket_msg_id=? WHERE id=?", (msg.id, sub["id"]))
         db.commit()
         await refresh_message(sub["id"])
@@ -535,8 +503,46 @@ class SubmissionView(discord.ui.View):
             return await i.response.send_message(err, ephemeral=True)
         await i.response.send_modal(ReasonModal(sub["id"]))
 
+    @discord.ui.button(label="Срочно", emoji="🔥", style=discord.ButtonStyle.secondary, custom_id="sub:prio")
+    async def prio(self, i: discord.Interaction, b: discord.ui.Button):
+        sub = find_sub(i)
+        if not sub:
+            return await i.response.send_message("Заявка не найдена.", ephemeral=True)
+        err = check_handle(i, sub)
+        if err:
+            return await i.response.send_message(err, ephemeral=True)
+        db.execute("UPDATE subs SET priority=? WHERE id=?", (0 if sub["priority"] else 1, sub["id"]))
+        db.commit()
+        await i.response.defer()
+        await refresh_message(sub["id"])
+
 
 # ====== ФОРМА ДЛЯ ИГРОКА ======
+async def validate_submission(i, kind, values, cfg):
+    """Возвращает текст ошибки или None, если обращение можно создавать."""
+    k = KINDS[kind]
+    if kind == "app" and not values["age"].isdigit():
+        return "Возраст нужно указать числом."
+    if store.active_count(i.guild.id, i.user.id, kind) >= k["max_active"]:
+        return "У тебя уже есть необработанные обращения этого типа."
+    if store.recent_count(i.guild.id, i.user.id, now() - SPAM_WINDOW) >= SPAM_LIMIT:
+        return "Слишком много обращений за последний час. Попробуй позже."
+    if kind == "app" and not is_team(i.user, cfg):
+        days = cfg.get("reapply_days", REAPPLY_DAYS)
+        last = store.last_rejected_ts(i.guild.id, i.user.id, kind)
+        if days and last and now() < last + days * 86400:
+            return f"Предыдущую заявку отклонили. Новую можно подать через {fmt_dur(last + days * 86400 - now())}."
+    if kind == "app" and cfg.get("mc_check", True):
+        nick = values["nick"].strip()
+        if not store.mc_nick_valid(nick):
+            return "Ник Minecraft: 3-16 символов, латиница, цифры и «_»."
+        if store.nick_taken(i.guild.id, nick, i.user.id):
+            return "Этот ник уже указан в другой заявке."
+        if await mojang.exists(nick) is False:
+            return f"Игрока **{nick}** нет в Minecraft (Java). Проверь, как пишется ник."
+    return None
+
+
 class FormModal(discord.ui.Modal):
     def __init__(self, kind):
         super().__init__(title=KINDS[kind]["label"][:45])
@@ -548,31 +554,23 @@ class FormModal(discord.ui.Modal):
 
     async def on_submit(self, i: discord.Interaction):
         k, cfg = KINDS[self.kind], gcfg(i.guild.id)
+        await i.response.defer(ephemeral=True)  # проверка ника в Mojang может занять пару секунд
         channel = i.guild.get_channel(cfg.get(f"{self.kind}_channel_id", 0))
         if not channel:
-            return await i.response.send_message("Раздел не настроен (/setup).", ephemeral=True)
+            return await i.followup.send("Раздел не настроен (/setup).", ephemeral=True)
         values = {key: v.value.strip() for key, v in self.inputs.items()}
-        if self.kind == "app" and not values["age"].isdigit():
-            return await i.response.send_message("Возраст нужно указать числом.", ephemeral=True)
-        active = db.execute("SELECT COUNT(*) FROM subs WHERE guild_id=? AND author_id=? AND kind=? "
-                            "AND status IN ('new','work')", (i.guild.id, i.user.id, self.kind)).fetchone()[0]
-        if active >= k["max_active"]:
-            return await i.response.send_message("У тебя уже есть необработанные обращения этого типа.", ephemeral=True)
+        err = await validate_submission(i, self.kind, values, cfg)
+        if err:
+            return await i.followup.send(err, ephemeral=True)
 
-        await i.response.defer(ephemeral=True)
         topic = k["topic"](values, i.user)[:200]
-        num = db.execute("SELECT COALESCE(MAX(num),0)+1 FROM subs WHERE guild_id=? AND kind=?",
-                         (i.guild.id, self.kind)).fetchone()[0]
-        cur = db.execute("INSERT INTO subs(guild_id,kind,author_id,topic,fields,created_ts,num) "
-                         "VALUES(?,?,?,?,?,?,?)",
-                         (i.guild.id, self.kind, i.user.id, topic, json.dumps(values, ensure_ascii=False), now(), num))
-        db.commit()
-        sid = cur.lastrowid
-        e, f, v = await render(sub_by_id(sid))
+        sid = store.create_sub(i.guild.id, self.kind, i.user.id, topic, values)
+        sub = sub_by_id(sid)
+        e, f, v = await render(sub)
         msg = await channel.send(embed=e, file=f, view=v)
         db.execute("UPDATE subs SET channel_id=?, message_id=? WHERE id=?", (channel.id, msg.id, sid))
         db.commit()
-        await i.followup.send(f"✅ Отправлено! Номер обращения: **#{num}**. Когда его возьмут в работу, "
+        await i.followup.send(f"✅ Отправлено! Номер обращения: **#{sub['num']}**. Когда его возьмут в работу, "
                               f"для тебя создадут отдельный канал.", ephemeral=True)
 
 
@@ -595,40 +593,16 @@ class PanelView(discord.ui.View):
 
 
 # ====== СТАТИСТИКА ======
-def leaderboard(gid, kind=None, since=0, limit=8):
-    q = ("SELECT handler_id, COUNT(*) total, SUM(status='approved') ok, AVG(closed_ts-created_ts) avg "
-         "FROM subs WHERE guild_id=? AND status IN ('approved','rejected') AND handler_id IS NOT NULL "
-         "AND closed_ts>=?")
-    args = [gid, since]
-    if kind:
-        q += " AND kind=?"
-        args.append(kind)
-    q += " GROUP BY handler_id ORDER BY total DESC, avg ASC LIMIT ?"
-    return db.execute(q, args + [limit]).fetchall()
-
-
-def totals(gid, kind=None, since=0):
-    w, a = "guild_id=?", [gid]
-    if kind:
-        w += " AND kind=?"
-        a.append(kind)
-    created = db.execute(f"SELECT COUNT(*) FROM subs WHERE {w} AND created_ts>=?", a + [since]).fetchone()[0]
-    h = db.execute(f"SELECT COUNT(*), SUM(status='approved'), AVG(closed_ts-created_ts) FROM subs "
-                   f"WHERE {w} AND status IN ('approved','rejected') AND closed_ts>=?", a + [since]).fetchone()
-    open_ = db.execute(f"SELECT COUNT(*) FROM subs WHERE {w} AND status IN ('new','work')", a).fetchone()[0]
-    return dict(created=created, handled=h[0], approved=h[1] or 0, avg=h[2], open=open_)
-
-
 _SAME = object()
 
 
 async def build_stats(guild, title, since=0, kind=None, board_kind=_SAME):
     bk = kind if board_kind is _SAME else board_kind
     board = []
-    for r in leaderboard(guild.id, bk, since):
-        m = guild.get_member(r["handler_id"])
+    for r in store.leaderboard(guild.id, bk, since):
+        m = await get_member(guild, r["handler_id"])
         board.append((m.display_name if m else f"ID {r['handler_id']}", r["total"], r["ok"] or 0, fmt_dur(r["avg"])))
-    t = totals(guild.id, kind, since)
+    t = store.totals(guild.id, kind, since)
     summary = f"Поступило {t['created']}  •  Обработано {t['handled']}  •  Ср. время {fmt_dur(t['avg'])}"
     img = await asyncio.to_thread(make_leaderboard, title, board, summary)
     e = discord.Embed(color=discord.Color.from_rgb(*GOLD))
@@ -645,7 +619,7 @@ async def post_weekly(guild):
     if not ch:
         return
     since = now() - 7 * 86400
-    apps = leaderboard(guild.id, "app", since)
+    apps = store.leaderboard(guild.id, "app", since)
     e, f = await build_stats(guild, "Вайтлистеры недели", since, kind=None, board_kind="app")
     e.title = "📊 Итоги недели"
     e.description = (f"🏆 **Лучший вайтлистер недели:** <@{apps[0]['handler_id']}> - обработано заявок: {apps[0]['total']}"
@@ -666,7 +640,7 @@ async def remind_unanswered():
             await msg.reply(f"{f'<@&{rid}> ' if rid else ''}⏰ Обращение **#{sub['num']}** без ответа уже больше суток!",
                             allowed_mentions=discord.AllowedMentions(roles=True))
         except Exception:
-            traceback.print_exc()
+            log.exception("remind_unanswered")
         db.execute("UPDATE subs SET pinged=1 WHERE id=?", (sub["id"],))
         db.commit()
 
@@ -680,7 +654,7 @@ async def cleanup_tickets():
             try:
                 await ch.delete()
             except discord.HTTPException:
-                traceback.print_exc()
+                log.exception("Не удалось удалить тикет %s", sub["ticket_channel_id"])
         db.execute("UPDATE subs SET ticket_channel_id=NULL WHERE id=?", (sub["id"],))
         db.commit()
 
@@ -698,13 +672,19 @@ async def weekly_check():
             await post_weekly(guild)
 
 
+async def daily_backup():
+    path = store.backup_db()
+    if path:
+        log.info("Резервная копия базы: %s", path)
+
+
 @tasks.loop(minutes=5)
 async def background():
-    for job in (remind_unanswered, cleanup_tickets, weekly_check):
+    for job in (remind_unanswered, cleanup_tickets, weekly_check, daily_backup):
         try:
             await job()
         except Exception:
-            traceback.print_exc()
+            log.exception("Фоновая задача %s", job.__name__)
 
 
 @background.before_loop
@@ -744,6 +724,23 @@ async def setup_roles(i: discord.Interaction, staff_role: discord.Role, app_role
              report_role_id=report_role.id, bug_role_id=bug_role.id)
     await i.response.send_message("✅ Роли сохранены. Теперь /panel_app, /panel_report и /panel_bug "
                                   "в нужных каналах.", ephemeral=True)
+
+
+@bot.tree.command(name="settings", description="Дополнительные настройки (только администраторы сервера)")
+@app_commands.describe(mc_check="Проверять ник Minecraft в заявках (формат, дубли, существование у Mojang)",
+                       reapply_days="Через сколько дней можно подать заявку после отказа (0 - без ограничения)")
+@app_commands.guild_only()
+@app_commands.checks.has_permissions(administrator=True)
+async def settings(i: discord.Interaction, mc_check: bool | None = None,
+                   reapply_days: app_commands.Range[int, 0, 365] | None = None):
+    if mc_check is not None:
+        set_gcfg(i.guild.id, mc_check=mc_check)
+    if reapply_days is not None:
+        set_gcfg(i.guild.id, reapply_days=reapply_days)
+    cfg = gcfg(i.guild.id)
+    await i.response.send_message(
+        f"Проверка ника Minecraft: **{'вкл' if cfg.get('mc_check', True) else 'выкл'}**\n"
+        f"Повторная заявка после отказа: **{cfg.get('reapply_days', REAPPLY_DAYS)} дн.**", ephemeral=True)
 
 
 async def send_panel(i: discord.Interaction, kind: str):
@@ -807,8 +804,7 @@ async def stats(i: discord.Interaction, kind: app_commands.Choice[str] | None = 
 @app_commands.guild_only()
 @team_only()
 async def stats_user(i: discord.Interaction, member: discord.Member):
-    rows = db.execute("SELECT kind, status, closed_ts-created_ts AS dur FROM subs WHERE guild_id=? AND handler_id=?",
-                      (i.guild.id, member.id)).fetchall()
+    rows = store.handler_rows(i.guild.id, member.id)
     done = [r for r in rows if r["status"] in ("approved", "rejected")]
     durs = [r["dur"] for r in done if r["dur"] is not None]
     e = discord.Embed(title=f"Статистика: {member.display_name}", color=discord.Color.from_rgb(*GOLD))
@@ -833,71 +829,87 @@ async def weekly_post(i: discord.Interaction):
     await i.followup.send("Отчёт отправлен в канал статистики.", ephemeral=True)
 
 
-# ====== ЦИТАТЫ ======
-QUOTE_HOOK = "Цитаты"
-NO_MENTIONS = discord.AllowedMentions.none()
+@bot.tree.command(name="queue", description="Открытые обращения: срочные первыми (персонал)")
+@app_commands.describe(kind="Раздел (по умолчанию - все, которые ты обрабатываешь)", urgent_only="Только срочные")
+@app_commands.choices(kind=KIND_CHOICES)
+@app_commands.guild_only()
+@staff_only()
+async def queue(i: discord.Interaction, kind: app_commands.Choice[str] | None = None, urgent_only: bool = False):
+    allowed = handled_kinds(i.user, gcfg(i.guild.id))
+    kinds = [kind.value] if kind and kind.value in allowed else allowed
+    rows = store.open_queue(i.guild.id, kinds, urgent_only)
+    if not rows:
+        return await i.response.send_message("Открытых обращений нет. 🎉", ephemeral=True)
+    lines = []
+    for r in rows:
+        k = KINDS[r["kind"]]
+        where = (f"[карточка](https://discord.com/channels/{r['guild_id']}/{r['channel_id']}/{r['message_id']})"
+                 if r["message_id"] else "")
+        who = f"<@{r['handler_id']}>" if r["handler_id"] else "никто"
+        lines.append(f"{'🔥' if r['priority'] else '▫️'} {k['emoji']} **#{r['num']}** {r['topic'][:40]} "
+                     f"- {'в работе' if r['status'] == 'work' else 'новая'} ({who}), "
+                     f"ждёт {fmt_dur(now() - r['created_ts'])} {where}")
+    await i.response.send_message(embed=discord.Embed(title="Открытые обращения", description="\n".join(lines),
+                                                      color=discord.Color.from_rgb(*GOLD)), ephemeral=True)
 
 
-def quote_names(user):
-    """(имя для шапки, подпись под цитатой): «ник | юзернейм»."""
-    same = user.display_name == user.name
-    return (user.name if same else f"{user.display_name} | {user.name}",
-            f"@{user.name}" if same else f"@{user.display_name} | {user.name}")
+@bot.tree.command(name="ticket", description="Найти обращение по номеру: данные и переписка (персонал)")
+@app_commands.describe(kind="Раздел", number="Номер обращения (из заголовка карточки)")
+@app_commands.choices(kind=KIND_CHOICES)
+@app_commands.guild_only()
+@staff_only()
+async def ticket(i: discord.Interaction, kind: app_commands.Choice[str], number: int):
+    if not can_handle(i.user, gcfg(i.guild.id), kind.value):
+        return await i.response.send_message("Нет доступа к этому разделу.", ephemeral=True)
+    sub = store.sub_by_num(i.guild.id, kind.value, number)
+    if not sub:
+        return await i.response.send_message("Такого обращения нет.", ephemeral=True)
+    user = await get_user(sub["author_id"])
+    e = details_embed(sub, user)
+    text, _ = status_info(sub)
+    e.add_field(name="Статус", value=text)
+    if sub["handler_id"]:
+        e.add_field(name="Обработал" if sub["closed_ts"] else "Обрабатывает", value=f"<@{sub['handler_id']}>")
+    e.add_field(name="Создано", value=f"<t:{sub['created_ts']}:f>")
+    if sub["closed_ts"]:
+        e.add_field(name="Время обработки", value=fmt_dur(sub["closed_ts"] - sub["created_ts"]))
+    if sub["reason"]:
+        e.add_field(name="Причина", value=sub["reason"][:1024], inline=False)
+    file = transcript_file(sub, sub["transcript"]) if sub["transcript"] is not None else None
+    if file:
+        await i.response.send_message(embed=e, file=file, ephemeral=True)
+    else:
+        await i.response.send_message(embed=e, ephemeral=True)
 
 
-async def post_quote(channel, user, text, signature=None, style="cream"):
-    """Рисует цитату и отправляет от имени автора (вебхук). Без права на вебхуки - обычным сообщением."""
+def rss_mb():
     try:
-        avatar = await user.display_avatar.replace(size=256, format="png").read()
-    except discord.HTTPException:
-        avatar = None
-    name, handle = quote_names(user)
-    buf = await asyncio.to_thread(make_quote, text, signature or handle, avatar, style)
-    is_thread = isinstance(channel, discord.Thread)
-    target = channel.parent if is_thread else channel
-    msg = None
-    try:
-        hooks = await target.webhooks()
-        hook = (discord.utils.find(lambda h: h.name == QUOTE_HOOK and h.token, hooks)
-                or await target.create_webhook(name=QUOTE_HOOK))
-        kw = {"thread": channel} if is_thread else {}
-        msg = await hook.send(file=discord.File(buf, "quote.png"), username=name[:80],
-                              avatar_url=user.display_avatar.url, allowed_mentions=NO_MENTIONS, wait=True, **kw)
-    except discord.HTTPException:
-        buf.seek(0)
-        msg = await channel.send(content=f"**{name}**", file=discord.File(buf, "quote.png"),
-                                 allowed_mentions=NO_MENTIONS)
-    try:
-        await msg.add_reaction("❤️")
-    except discord.HTTPException:
+        with open("/proc/self/status") as f:
+            for line in f:
+                if line.startswith("VmRSS:"):
+                    return int(line.split()[1]) / 1024
+    except OSError:
         pass
+    return None
 
 
-STYLE_CHOICES = [app_commands.Choice(name="Светлая (как в примерах)", value="cream"),
-                 app_commands.Choice(name="Тёмная (красно-золотая)", value="dark")]
-
-
-@bot.tree.command(name="quote", description="Оформить цитату картинкой")
-@app_commands.describe(text="Текст цитаты", user="Чья цитата (по умолчанию - ты)",
-                       signature="Своя подпись вместо @ника", style="Оформление")
-@app_commands.choices(style=STYLE_CHOICES)
+@bot.tree.command(name="health", description="Состояние бота: аптайм, память, база, копии (админка)")
 @app_commands.guild_only()
-async def quote(i: discord.Interaction, text: app_commands.Range[str, 1, 400],
-                user: discord.Member | None = None, signature: app_commands.Range[str, 1, 50] | None = None,
-                style: app_commands.Choice[str] | None = None):
-    await i.response.defer(ephemeral=True)
-    await post_quote(i.channel, user or i.user, text, signature, style.value if style else "cream")
-    await i.followup.send("Цитата отправлена.", ephemeral=True)
-
-
-@bot.tree.context_menu(name="Цитата")
-@app_commands.guild_only()
-async def quote_message(i: discord.Interaction, message: discord.Message):
-    if not message.clean_content.strip():
-        return await i.response.send_message("В сообщении нет текста.", ephemeral=True)
-    await i.response.defer(ephemeral=True)
-    await post_quote(i.channel, message.author, message.clean_content[:400])
-    await i.followup.send("Цитата отправлена.", ephemeral=True)
+@team_only()
+async def health(i: discord.Interaction):
+    up = fmt_dur(time.time() - bot.started_ts)
+    rss = rss_mb()
+    counts = store.open_counts(i.guild.id)
+    last = store.backup_files()
+    e = discord.Embed(title="🩺 Состояние бота", color=discord.Color.from_rgb(*GOLD))
+    e.add_field(name="Аптайм", value=up)
+    e.add_field(name="Пинг", value=f"{bot.latency * 1000:.0f} мс")
+    e.add_field(name="Память", value=f"{rss:.0f} МБ" if rss else "н/д")
+    e.add_field(name="Открытых обращений", value=f"новых {counts['new']}, в работе {counts['work']}")
+    e.add_field(name="База", value=f"{store.db_size() / 1024:.0f} КБ")
+    e.add_field(name="Последняя копия", value=last[-1][5:-3] if last else "нет")
+    e.set_footer(text=f"Python {platform.python_version()} • discord.py {discord.__version__}")
+    await i.response.send_message(embed=e, ephemeral=True)
 
 
 @bot.event
@@ -926,12 +938,18 @@ async def on_message(message: discord.Message):
 
 @bot.event
 async def on_ready():
-    print(f"Вошёл как {bot.user}")
+    log.info("Вошёл как %s", bot.user)
 
 
-if __name__ == "__main__":
+def main():
+    setup_logging()
+    store.init(legacy_dir=".")
     token = os.environ.get("DISCORD_TOKEN", "").strip()
     if not token:
         raise SystemExit("Не найден DISCORD_TOKEN. Добавь его в переменные окружения хоста "
                          "или в файл .env рядом с bot.py (строка DISCORD_TOKEN=токен).")
-    bot.run(token)
+    bot.run(token, log_handler=None)
+
+
+if __name__ == "__main__":
+    main()
