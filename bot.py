@@ -636,7 +636,8 @@ async def ping_role(msg, sub, text):
     if not rid:
         return
     try:
-        await msg.reply(f"<@&{rid}> {text}", allowed_mentions=discord.AllowedMentions(roles=[discord.Object(rid)]))
+        await msg.reply(f"<@&{rid}> {text}", allowed_mentions=discord.AllowedMentions(everyone=False, users=False, replied_user=False,
+                                                                      roles=[discord.Object(rid)]))
     except discord.HTTPException:
         log.exception("Не удалось пингануть роль")
 
