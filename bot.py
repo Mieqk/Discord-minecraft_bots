@@ -570,6 +570,7 @@ class FormModal(discord.ui.Modal):
         msg = await channel.send(embed=e, file=f, view=v)
         db.execute("UPDATE subs SET channel_id=?, message_id=? WHERE id=?", (channel.id, msg.id, sid))
         db.commit()
+        await ping_role(msg, sub, f"🔔 Новое обращение **#{sub['num']}**: {k['label'].lower()}, нужен обработчик.")
         await i.followup.send(f"✅ Отправлено! Номер обращения: **#{sub['num']}**. Когда его возьмут в работу, "
                               f"для тебя создадут отдельный канал.", ephemeral=True)
 
@@ -627,18 +628,50 @@ async def post_weekly(guild):
     await ch.send(embed=e, file=f)
 
 
+# ====== НАПОМИНАНИЯ ======
+async def ping_role(msg, sub, text):
+    """Ответ под карточкой, который тегает роль-обработчика этого раздела (и только её)."""
+    cfg = gcfg(sub["guild_id"])
+    rid = kind_role_id(cfg, sub["kind"]) or cfg.get("staff_role_id")
+    if not rid:
+        return
+    try:
+        await msg.reply(f"<@&{rid}> {text}", allowed_mentions=discord.AllowedMentions(everyone=False, users=False, replied_user=False,
+                                                                      roles=[discord.Object(rid)]))
+    except discord.HTTPException:
+        log.exception("Не удалось пингануть роль")
+
+
+async def remind_handlers():
+    """Заявка в работе, а в тикете тихо больше суток: пингуем в самом тикете того, кто её взял.
+    Сообщение бота тоже считается последним, поэтому повтор будет не чаще раза в сутки."""
+    rows = db.execute("SELECT * FROM subs WHERE status='work' AND ticket_channel_id IS NOT NULL "
+                      "AND handler_id IS NOT NULL").fetchall()
+    for sub in rows:
+        ch = bot.get_channel(sub["ticket_channel_id"])
+        if not ch:
+            continue
+        last = (discord.utils.snowflake_time(ch.last_message_id).timestamp()
+                if ch.last_message_id else sub["created_ts"])
+        if now() - last < REMIND_AFTER:
+            continue
+        try:
+            await ch.send(f"<@{sub['handler_id']}>, по обращению **#{sub['num']}** тихо больше суток. "
+                          f"Ответь игроку или закрой обращение.")
+        except discord.HTTPException:
+            log.exception("remind_handlers")
+
+
 # ====== ФОНОВЫЕ ЗАДАЧИ ======
 async def remind_unanswered():
+    """Обращение так никто и не взял сутки: ещё раз тегаем роль-обработчика под карточкой."""
     rows = db.execute("SELECT * FROM subs WHERE status='new' AND pinged=0 AND created_ts<?",
                       (now() - REMIND_AFTER,)).fetchall()
     for sub in rows:
-        cfg = gcfg(sub["guild_id"])
-        rid = kind_role_id(cfg, sub["kind"]) or cfg.get("staff_role_id")
         try:
             ch = bot.get_channel(sub["channel_id"])
             msg = await ch.fetch_message(sub["message_id"])
-            await msg.reply(f"{f'<@&{rid}> ' if rid else ''}⏰ Обращение **#{sub['num']}** без ответа уже больше суток!",
-                            allowed_mentions=discord.AllowedMentions(roles=True))
+            await ping_role(msg, sub, f"⏰ Обращение **#{sub['num']}** без ответа уже больше суток!")
         except Exception:
             log.exception("remind_unanswered")
         db.execute("UPDATE subs SET pinged=1 WHERE id=?", (sub["id"],))
@@ -680,7 +713,7 @@ async def daily_backup():
 
 @tasks.loop(minutes=5)
 async def background():
-    for job in (remind_unanswered, cleanup_tickets, weekly_check, daily_backup):
+    for job in (remind_unanswered, remind_handlers, cleanup_tickets, weekly_check, daily_backup):
         try:
             await job()
         except Exception:
@@ -880,6 +913,31 @@ async def ticket(i: discord.Interaction, kind: app_commands.Choice[str], number:
         await i.response.send_message(embed=e, file=file, ephemeral=True)
     else:
         await i.response.send_message(embed=e, ephemeral=True)
+
+
+def roles_with_access(channel):
+    """Роли (кроме @everyone и ботов), которые видят канал, и почему: [(роль, причина)]."""
+    out = []
+    for role in channel.guild.roles:
+        if role.is_default() or role.managed:
+            continue
+        perms = channel.permissions_for(role)
+        if perms.view_channel:
+            out.append((role, "право «Администратор»" if perms.administrator else "право на просмотр каналов"))
+    return out
+
+
+@bot.tree.command(name="access", description="Кто видит этот канал: роли и причина (админка, вызывать в тикете)")
+@app_commands.guild_only()
+@team_only()
+async def access(i: discord.Interaction):
+    rows = roles_with_access(i.channel)
+    lines = [f"{r.mention} - {why}" for r, why in rows] or ["Ни одна роль не видит этот канал."]
+    e = discord.Embed(title="Кто видит этот канал", description="\n".join(lines),
+                      color=discord.Color.from_rgb(*GOLD))
+    e.set_footer(text="Роли с правом «Администратор» видят все каналы, Discord этого не скрывает. "
+                      "Чтобы канал был скрыт от роли, уберите у неё это право.")
+    await i.response.send_message(embed=e, ephemeral=True, allowed_mentions=discord.AllowedMentions.none())
 
 
 def rss_mb():
