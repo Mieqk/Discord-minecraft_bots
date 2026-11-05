@@ -930,4 +930,8 @@ async def on_ready():
 
 
 if __name__ == "__main__":
-    bot.run(os.environ["DISCORD_TOKEN"])
+    token = os.environ.get("DISCORD_TOKEN", "").strip()
+    if not token:
+        raise SystemExit("Не найден DISCORD_TOKEN. Добавь его в переменные окружения хоста "
+                         "или в файл .env рядом с bot.py (строка DISCORD_TOKEN=токен).")
+    bot.run(token)
