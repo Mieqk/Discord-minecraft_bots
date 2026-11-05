@@ -2,3 +2,5 @@
 __pycache__/
 *.pyc
 fonts/
+data/
+.pytest_cache/
