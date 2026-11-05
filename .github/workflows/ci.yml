@@ -11,5 +11,5 @@ jobs:
         with:
           python-version: "3.12"
       - run: pip install -r requirements.txt pytest
-      - run: python -m py_compile bot.py cards.py store.py kinds.py quotes.py mojang.py
+      - run: python -m py_compile *.py
       - run: python -m pytest -q
