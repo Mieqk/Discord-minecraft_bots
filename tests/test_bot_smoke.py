@@ -3,7 +3,8 @@ import asyncio
 
 
 def test_commands_register(store):
-    import bot as b
+    import bot  # noqa: F401  (регистрирует команды)
+    import core as b
     from quotes import Quotes
 
     async def go():
@@ -21,7 +22,7 @@ def test_commands_register(store):
 
 
 def test_submission_view_has_five_custom_ids():
-    import bot as b
+    import tickets as b
     ids = {c.custom_id for c in b.SubmissionView().children}
     assert ids == {"sub:details", "sub:take", "sub:ok", "sub:no", "sub:prio"}
     closed = b.SubmissionView("app", "approved", 1)
@@ -29,7 +30,7 @@ def test_submission_view_has_five_custom_ids():
 
 
 def test_modals_fit_discord_limits():
-    import bot as b
+    import forms as b
     from kinds import KINDS
     for kind, k in KINDS.items():
         assert len(k["fields"]) <= 5, kind                      # в форме Discord максимум 5 полей
@@ -49,7 +50,7 @@ def test_missing_token_message(monkeypatch, tmp_path):
 
 def test_roles_with_access_reports_reason():
     import discord
-    import bot as b
+    import commands as b
 
     class Role:
         def __init__(self, name, default=False, managed=False):

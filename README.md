@@ -40,4 +40,4 @@
 pip install -r requirements.txt pytest
 python -m pytest
 ```
-Структура: `bot.py` — тикеты и команды, `store.py` — база, настройки, статистика, копии, `kinds.py` — виды обращений, `quotes.py` — цитаты, `cards.py` — картинки, `mojang.py` — проверка ника.
+Структура: `bot.py` — точка входа, `core.py` — объект бота, права, поиск участников, `tickets.py` — карточка, кнопки, тикет, закрытие, `forms.py` — форма и проверки заявки, `commands.py` — слэш-команды, `jobs.py` — фоновые задачи, `stats.py` — статистика, `store.py` — база, настройки, копии, `kinds.py` — виды обращений, `quotes.py` — цитаты, `cards.py` — картинки, `mojang.py` — проверка ника.

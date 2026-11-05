@@ -1,7 +1,8 @@
 import asyncio
 from types import SimpleNamespace as NS
 
-import bot as b
+import forms as b
+import tickets
 import mojang
 
 
@@ -68,9 +69,9 @@ def test_mojang_is_only_a_note(store, monkeypatch):
 
 
 def test_mojang_note_shown_on_card():
-    assert b.mojang_field({"_mojang": "missing"})[0][1].startswith("⚠️")
-    assert b.mojang_field({"_mojang": "found"})[0][1].startswith("✅")
-    assert b.mojang_field({}) == []
+    assert tickets.mojang_field({"_mojang": "missing"})[0][1].startswith("⚠️")
+    assert tickets.mojang_field({"_mojang": "found"})[0][1].startswith("✅")
+    assert tickets.mojang_field({}) == []
 
 
 def test_mojang_status_mapping():
