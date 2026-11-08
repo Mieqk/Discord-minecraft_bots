@@ -34,3 +34,12 @@ def test_base_is_cached_but_copied():
     assert a is not b
     a.putpixel((5, 5), (1, 2, 3, 255))
     assert cards.base(300).getpixel((5, 5)) != (1, 2, 3, 255)
+
+
+def test_quote_with_background_keeps_text_position():
+    """Уголки не должны сдвигать текст (в цикле уголков не переиспользуем координаты текста)."""
+    bg = io.BytesIO()
+    Image.new("RGB", (300, 200), (0, 0, 0)).save(bg, "PNG")
+    img = png(cards.make_quote("Привет", "@x", None, "dark", bg.getvalue())).convert("RGB")
+    left = img.crop((200, 60, 480, 140))     # здесь должен быть текст цитаты (светлые пиксели на тёмном фоне)
+    assert max(sum(px) for px in left.getdata()) > 600

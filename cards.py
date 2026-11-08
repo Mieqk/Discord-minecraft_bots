@@ -202,9 +202,9 @@ def font_regular(size):
 
 
 @serialized
-def make_quote(text, handle, avatar=None, style="cream", background=None):
+def make_quote(text, handle, avatar=None, style="dark", background=None):
     """Цитата: аватар слева, крупный текст, тонкая линия и подпись.
-    style="cream" - как в примерах (светлый градиент), style="dark" - палитра проекта.
+    style="dark" - палитра проекта (чёрный фон, красное свечение, золотые уголки), style="cream" - светлый градиент.
     background - байты картинки: ложится фоном с затемнением (как в примере с драконом)."""
     text = " ".join(text.split())[:400]
     tf = font_regular(44) if style == "cream" else font(40)
@@ -232,6 +232,10 @@ def make_quote(text, handle, avatar=None, style="cream", background=None):
         ink, sub, mark = INK, BROWN, ORANGE_SOFT
 
     d = ImageDraw.Draw(img)
+    if bg is not None:  # золотые уголки, как на остальных карточках
+        for (cx, cy, dx, dy) in [(16, 16, 1, 1), (W - 16, 16, -1, 1), (16, h - 16, 1, -1), (W - 16, h - 16, -1, -1)]:
+            d.line((cx, cy, cx + dx * 38, cy), fill=GOLD + (210,), width=2)
+            d.line((cx, cy, cx, cy + dy * 38), fill=GOLD + (210,), width=2)
     if avatar:
         av = circle_avatar(avatar, 130)
         ay = (h - 130) // 2

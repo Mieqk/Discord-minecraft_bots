@@ -1,4 +1,5 @@
 """Цитаты: картинка от имени автора (вебхук), избранное по реакции ⭐, фон-картинка."""
+import time
 import asyncio
 import logging
 
@@ -16,8 +17,20 @@ NO_MENTIONS = discord.AllowedMentions.none()
 HEART, STAR = "❤️", "⭐"
 MAX_BG_BYTES = 4 * 1024 * 1024
 
-STYLE_CHOICES = [app_commands.Choice(name="Светлая (как в примерах)", value="cream"),
-                 app_commands.Choice(name="Тёмная (красно-золотая)", value="dark")]
+STYLE_CHOICES = [app_commands.Choice(name="Тёмная, красно-золотая (по умолчанию)", value="dark"),
+                 app_commands.Choice(name="Светлая", value="cream")]
+AUTO_COOLDOWN = 5  # секунд между автоцитатами одного человека
+
+
+def split_signature(text):
+    """«Текст\n— Подпись»: последняя строка с тире становится подписью. Возвращает (текст, подпись или None)."""
+    lines = text.strip().splitlines()
+    if len(lines) > 1 and lines[-1].lstrip().startswith(("—", "–", "--")):
+        sig = lines[-1].lstrip("—–- ").strip()[:50]
+        body = "\n".join(lines[:-1]).strip()
+        if sig and body:
+            return body, sig
+    return text.strip(), None
 
 
 def quote_names(user):
@@ -35,9 +48,10 @@ class Quotes(commands.Cog):
     def __init__(self, bot):
         self.bot = bot
         self.menus = [
-            app_commands.ContextMenu(name="Цитата", callback=self.quote_light),
-            app_commands.ContextMenu(name="Цитата (тёмная)", callback=self.quote_dark),
+            app_commands.ContextMenu(name="Цитата", callback=self.quote_dark),
+            app_commands.ContextMenu(name="Цитата (светлая)", callback=self.quote_light),
         ]
+        self._last = {}
         for m in self.menus:
             m.guild_only = True
             bot.tree.add_command(m)
@@ -47,7 +61,7 @@ class Quotes(commands.Cog):
             self.bot.tree.remove_command(m.name, type=m.type)
 
     # ----- отправка -----
-    async def post_quote(self, channel, user, text, signature=None, style="cream", background=None):
+    async def post_quote(self, channel, user, text, signature=None, style="dark", background=None):
         try:
             avatar = await user.display_avatar.replace(size=256, format="png").read()
         except discord.HTTPException:
@@ -93,7 +107,7 @@ class Quotes(commands.Cog):
         await i.response.defer(ephemeral=True)
         if background:
             data = await background.read()
-        await self.post_quote(i.channel, user or i.user, text, signature, style.value if style else "cream", data)
+        await self.post_quote(i.channel, user or i.user, text, signature, style.value if style else "dark", data)
         await i.followup.send("Цитата отправлена. Поставь ⭐ на цитату, чтобы сохранить её в избранное.", ephemeral=True)
 
     async def _quote_message(self, i, message, style):
@@ -109,6 +123,62 @@ class Quotes(commands.Cog):
 
     async def quote_dark(self, i: discord.Interaction, message: discord.Message):
         await self._quote_message(i, message, "dark")
+
+    @app_commands.command(name="quote_channel", description="Канал, где сообщения сами становятся цитатами (админка)")
+    @app_commands.describe(channel="Канал цитат (не указывай, чтобы выключить)")
+    @app_commands.guild_only()
+    @app_commands.checks.has_permissions(administrator=True)
+    async def quote_channel(self, i: discord.Interaction, channel: discord.TextChannel | None = None):
+        store.set_gcfg(i.guild.id, quote_channel_id=channel.id if channel else 0)
+        if not channel:
+            return await i.response.send_message("Автоцитаты выключены.", ephemeral=True)
+        perms = channel.permissions_for(i.guild.me)
+        need = {"manage_webhooks": "управлять вебхуками (цитата от имени автора)",
+                "manage_messages": "управлять сообщениями (удалять исходное сообщение)",
+                "send_messages": "писать в канал", "attach_files": "прикреплять файлы",
+                "add_reactions": "ставить реакции"}
+        missing = [text for attr, text in need.items() if not getattr(perms, attr)]
+        warn = ("\n⚠️ У бота в этом канале нет права: " + "; ".join(missing)) if missing else ""
+        await i.response.send_message(
+            f"Теперь любое сообщение в {channel.mention} станет цитатой. Подпись: последняя строка, начинающаяся "
+            f"с «—». Картинка во вложении станет фоном.{warn}", ephemeral=True)
+
+    @commands.Cog.listener()
+    async def on_message(self, message: discord.Message):
+        """В канале цитат сообщение автоматически превращается в цитату от имени автора."""
+        if message.author.bot or not message.guild:
+            return
+        quote_channel = store.gcfg(message.guild.id).get("quote_channel_id")
+        if not quote_channel or message.channel.id != quote_channel:
+            return
+        text, signature = split_signature(message.clean_content)
+        if not text:
+            return
+        if len(text) > 400:
+            return await message.channel.send(f"{message.author.mention}, цитата длиннее 400 символов.",
+                                              delete_after=8, allowed_mentions=discord.AllowedMentions(users=[message.author]))
+        now = time.monotonic()
+        if now - self._last.get(message.author.id, -AUTO_COOLDOWN) < AUTO_COOLDOWN:
+            return await message.channel.send(f"{message.author.mention}, не так быстро.", delete_after=5,
+                                              allowed_mentions=discord.AllowedMentions(users=[message.author]))
+        self._last[message.author.id] = now
+        background = None
+        for a in message.attachments:
+            if (a.content_type or "").startswith("image/") and a.size <= MAX_BG_BYTES:
+                try:
+                    background = await a.read()
+                except discord.HTTPException:
+                    pass
+                break
+        try:
+            await self.post_quote(message.channel, message.author, text, signature, "dark", background)
+        except Exception:
+            log.exception("Автоцитата не отправилась")
+            return
+        try:
+            await message.delete()
+        except discord.HTTPException:
+            log.warning("Не удалось удалить исходное сообщение в канале цитат (нужно право «Управлять сообщениями»)")
 
     quotes = app_commands.Group(name="quotes", description="Цитаты сервера", guild_only=True)
 
