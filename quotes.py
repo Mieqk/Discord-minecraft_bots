@@ -8,7 +8,8 @@ from discord import app_commands
 from discord.ext import commands
 
 import store
-from cards import make_quote
+from cards import make_quote, make_banner, GOLD
+from core import team_only
 
 log = logging.getLogger("bot")
 
@@ -40,6 +41,38 @@ def quote_names(user):
             f"@{user.name}" if same else f"@{user.display_name} | {user.name}")
 
 
+def cooldown_ok(last, uid):
+    """Не чаще одной цитаты в AUTO_COOLDOWN секунд от одного человека. last - словарь {id: время}."""
+    t = time.monotonic()
+    if t - last.get(uid, -AUTO_COOLDOWN) < AUTO_COOLDOWN:
+        return False
+    last[uid] = t
+    return True
+
+
+class QuoteModal(discord.ui.Modal, title="Цитата"):
+    text = discord.ui.TextInput(label="Текст цитаты", style=discord.TextStyle.paragraph, max_length=400)
+    signature = discord.ui.TextInput(label="Подпись (необязательно)", required=False, max_length=50)
+
+    async def on_submit(self, i: discord.Interaction):
+        cog = i.client.get_cog("Quotes")
+        await i.response.defer(ephemeral=True)
+        if not cooldown_ok(cog._last, i.user.id):
+            return await i.followup.send("Не так быстро, подожди пару секунд.", ephemeral=True)
+        await cog.post_quote(i.channel, i.user, self.text.value.strip(), self.signature.value.strip() or None, "dark")
+        await i.followup.send("Цитата отправлена.", ephemeral=True)
+
+
+class QuotePanelView(discord.ui.View):
+    def __init__(self):
+        super().__init__(timeout=None)
+
+    @discord.ui.button(label="Оставить цитату", emoji="💬", style=discord.ButtonStyle.secondary,
+                       custom_id="panel:quote")
+    async def leave(self, i: discord.Interaction, b: discord.ui.Button):
+        await i.response.send_modal(QuoteModal())
+
+
 def link(q):
     return f"https://discord.com/channels/{q['guild_id']}/{q['channel_id']}/{q['message_id']}"
 
@@ -55,6 +88,9 @@ class Quotes(commands.Cog):
         for m in self.menus:
             m.guild_only = True
             bot.tree.add_command(m)
+
+    async def cog_load(self):
+        self.bot.add_view(QuotePanelView())
 
     async def cog_unload(self):
         for m in self.menus:
@@ -124,6 +160,25 @@ class Quotes(commands.Cog):
     async def quote_dark(self, i: discord.Interaction, message: discord.Message):
         await self._quote_message(i, message, "dark")
 
+    @app_commands.command(name="panel_quote", description="Панель цитат: канал, где сообщения сами становятся цитатами")
+    @app_commands.guild_only()
+    @team_only()
+    async def panel_quote(self, i: discord.Interaction):
+        await i.response.defer(ephemeral=True)
+        banner = await asyncio.to_thread(make_banner, i.guild.name, "Цитаты")
+        e = discord.Embed(title="💬 Цитаты", color=discord.Color.from_rgb(*GOLD), description=(
+            "Нажми кнопку или просто напиши сообщение в этом канале: бот сам заменит его цитатой от твоего имени.\n"
+            "• Подпись: последняя строка, начинающаяся с «—».\n"
+            "• Картинка во вложении станет фоном цитаты."))
+        e.set_image(url="attachment://panel.png")
+        await i.channel.send(embed=e, file=discord.File(banner, "panel.png"), view=QuotePanelView())
+        store.set_gcfg(i.guild.id, quote_channel_id=i.channel.id)
+        perms = i.channel.permissions_for(i.guild.me)
+        missing = [t for a, t in (("manage_webhooks", "управлять вебхуками"), ("manage_messages", "управлять сообщениями"),
+                                  ("add_reactions", "ставить реакции")) if not getattr(perms, a)]
+        warn = ("\n⚠️ У бота в этом канале нет права: " + "; ".join(missing)) if missing else ""
+        await i.followup.send("Панель отправлена, этот канал стал каналом цитат." + warn, ephemeral=True)
+
     @app_commands.command(name="quote_channel", description="Канал, где сообщения сами становятся цитатами (админка)")
     @app_commands.describe(channel="Канал цитат (не указывай, чтобы выключить)")
     @app_commands.guild_only()
@@ -153,15 +208,16 @@ class Quotes(commands.Cog):
             return
         text, signature = split_signature(message.clean_content)
         if not text:
+            if message.attachments:
+                await message.channel.send(f"{message.author.mention}, добавь к картинке текст цитаты.", delete_after=8,
+                                           allowed_mentions=discord.AllowedMentions(users=[message.author]))
             return
         if len(text) > 400:
             return await message.channel.send(f"{message.author.mention}, цитата длиннее 400 символов.",
                                               delete_after=8, allowed_mentions=discord.AllowedMentions(users=[message.author]))
-        now = time.monotonic()
-        if now - self._last.get(message.author.id, -AUTO_COOLDOWN) < AUTO_COOLDOWN:
+        if not cooldown_ok(self._last, message.author.id):
             return await message.channel.send(f"{message.author.mention}, не так быстро.", delete_after=5,
                                               allowed_mentions=discord.AllowedMentions(users=[message.author]))
-        self._last[message.author.id] = now
         background = None
         for a in message.attachments:
             if (a.content_type or "").startswith("image/") and a.size <= MAX_BG_BYTES:
