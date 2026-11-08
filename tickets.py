@@ -7,7 +7,7 @@ import rcon
 from store import db, gcfg, now, fmt_dur, make_nick, sub_by_id
 from kinds import KINDS, PARA
 from cards import make_card, GOLD, ORANGE, GREEN, RED_LIGHT
-from core import bot, log, can_handle, get_user, get_member
+from core import bot, log, can_handle, get_user, get_member, modal_error
 
 NICK_FROM_USERNAME = True       # True: ник из юзернейма (carburadiator), False: из отображаемого имени
 
@@ -193,7 +193,7 @@ async def whitelist_note(sub):
     if res is None:
         return ""
     ok, text = res
-    return f"\nВайтлист: {'добавлен' if ok else 'НЕ добавлен'} - {text}"
+    return f"\nВайтлист: {'добавлен' if ok else 'НЕ добавлен'} - {text[:300]}"
 
 
 async def lock_ticket(sub):
@@ -259,10 +259,16 @@ async def send_log(sub, nick_note, dur, transcript, wl_note=""):
 
 async def finish(sid, status, handler_id, reason=None):
     """Закрывает обращение. Возвращает короткий текст, который увидит только нажавший модератор."""
-    db.execute("UPDATE subs SET status=?, handler_id=?, reason=?, closed_ts=? WHERE id=?",
-               (status, handler_id, reason, now(), sid))
+    # атомарно: если обращение уже закрыли (двое нажали одновременно, автозакрытие), второй раз не обрабатываем
+    cur = db.execute("UPDATE subs SET status=?, handler_id=?, reason=?, closed_ts=? WHERE id=? "
+                     "AND status IN ('new','work')", (status, handler_id, reason, now(), sid))
     db.commit()
-    await refresh_message(sid)
+    if cur.rowcount == 0:
+        return "Это обращение уже закрыто."
+    try:
+        await refresh_message(sid)
+    except Exception:
+        log.exception("refresh_message")
     sub = sub_by_id(sid)
     k, ok = KINDS[sub["kind"]], status == "approved"
     dur = fmt_dur(sub["closed_ts"] - sub["created_ts"])
@@ -326,6 +332,9 @@ class ReasonModal(discord.ui.Modal, title="Отклонить"):
         summary = await finish(self.sid, "rejected", i.user.id, self.reason.value or None)
         await i.followup.send(summary, ephemeral=True)
 
+    async def on_error(self, i: discord.Interaction, error: Exception):
+        await modal_error(i, error)
+
 
 class SubmissionView(discord.ui.View):
     def __init__(self, kind=None, status="new", priority=0):
@@ -366,23 +375,31 @@ class SubmissionView(discord.ui.View):
         if cur.rowcount == 0:
             return await i.response.send_message("Эту заявку только что взяли.", ephemeral=True)
         await i.response.defer()
+        channel = None
         try:
             channel = await open_ticket_channel(i.guild, sub, i.user)
-        except discord.HTTPException:
+            db.execute("UPDATE subs SET ticket_channel_id=? WHERE id=?", (channel.id, sub["id"]))
+            db.commit()
+            sub = sub_by_id(sub["id"])
+            author = await get_user(sub["author_id"])
+            msg = await channel.send(
+                content=f"<@{sub['author_id']}>, {KINDS[sub['kind']]['acc']} взял в работу {i.user.mention}",
+                embed=full_embed(sub, author), view=SubmissionView(sub["kind"], "work", sub["priority"]))
+            db.execute("UPDATE subs SET ticket_msg_id=? WHERE id=?", (msg.id, sub["id"]))
+            db.commit()
+        except Exception:
+            # не вышло создать тикет: откатываем, иначе обращение застрянет «в работе» без канала
             log.exception("Не удалось создать канал тикета")
-            db.execute("UPDATE subs SET status='new', handler_id=NULL WHERE id=?", (sub["id"],))
+            if channel:
+                try:
+                    await channel.delete()
+                except discord.HTTPException:
+                    pass
+            db.execute("UPDATE subs SET status='new', handler_id=NULL, ticket_channel_id=NULL, ticket_msg_id=NULL "
+                       "WHERE id=?", (sub["id"],))
             db.commit()
             return await i.followup.send("Не смог создать канал тикета. Дай боту право «Управлять каналами» "
                                          "и доступ к категории тикетов.", ephemeral=True)
-        db.execute("UPDATE subs SET ticket_channel_id=? WHERE id=?", (channel.id, sub["id"]))
-        db.commit()
-        sub = sub_by_id(sub["id"])
-        author = await get_user(sub["author_id"])
-        msg = await channel.send(
-            content=f"<@{sub['author_id']}>, {KINDS[sub['kind']]['acc']} взял в работу {i.user.mention}",
-            embed=full_embed(sub, author), view=SubmissionView(sub["kind"], "work", sub["priority"]))
-        db.execute("UPDATE subs SET ticket_msg_id=? WHERE id=?", (msg.id, sub["id"]))
-        db.commit()
         await refresh_message(sub["id"])
         link = discord.ui.View()
         link.add_item(discord.ui.Button(label="Открыть тикет", emoji="📂", url=channel.jump_url))

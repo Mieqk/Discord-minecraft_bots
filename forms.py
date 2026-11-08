@@ -5,7 +5,7 @@ import store
 import mojang
 from store import db, gcfg, now, fmt_dur, sub_by_id
 from kinds import KINDS
-from core import is_team, ping_role
+from core import is_team, ping_role, log, modal_error
 from tickets import render
 
 SPAM_LIMIT, SPAM_WINDOW = 5, 3600   # не больше 5 обращений в час от одного человека
@@ -70,16 +70,31 @@ class FormModal(discord.ui.Modal):
             note = await mojang_note(values, cfg)
             if note:
                 values["_mojang"] = note
+        # проверка ника могла занять секунды: за это время игрок мог подать ещё одно обращение
+        if store.active_count(i.guild.id, i.user.id, self.kind) >= k["max_active"]:
+            return await i.followup.send("У тебя уже есть необработанные обращения этого типа.", ephemeral=True)
         topic = k["topic"](values, i.user)[:200]
         sid = store.create_sub(i.guild.id, self.kind, i.user.id, topic, values)
         sub = sub_by_id(sid)
-        e, f, v = await render(sub)
-        msg = await channel.send(embed=e, file=f, view=v)
-        db.execute("UPDATE subs SET channel_id=?, message_id=? WHERE id=?", (channel.id, msg.id, sid))
-        db.commit()
+        try:
+            e, f, v = await render(sub)
+            msg = await channel.send(embed=e, file=f, view=v)
+            db.execute("UPDATE subs SET channel_id=?, message_id=? WHERE id=?", (channel.id, msg.id, sid))
+            db.commit()
+        except Exception:
+            # карточка не ушла: убираем запись, иначе игрок навсегда упрётся в «уже есть необработанные обращения»
+            log.exception("Не удалось отправить обращение в канал персонала")
+            db.execute("DELETE FROM subs WHERE id=?", (sid,))
+            db.commit()
+            return await i.followup.send("Не получилось отправить обращение (у бота нет доступа к каналу?). "
+                                         "Попробуй позже или напиши администрации.", ephemeral=True)
         await ping_role(msg, sub, f"🔔 Новое обращение **#{sub['num']}**: {k['label'].lower()}, нужен обработчик.")
         await i.followup.send(f"✅ Отправлено! Номер обращения: **#{sub['num']}**. Когда его возьмут в работу, "
                               f"для тебя создадут отдельный канал.", ephemeral=True)
+
+
+    async def on_error(self, i: discord.Interaction, error: Exception):
+        await modal_error(i, error)
 
 
 # ====== ПАНЕЛЬ ======

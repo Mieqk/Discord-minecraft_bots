@@ -3,11 +3,12 @@ import os
 import logging
 from dotenv import load_dotenv
 
+load_dotenv()  # до импорта остальных модулей: store читает DATA_DIR из окружения при импорте
+
 import store
 import core, tickets, forms, stats, jobs, commands  # noqa: F401,E402  (регистрируют команды и события)
 from core import bot, setup_logging
 
-load_dotenv()
 log = logging.getLogger("bot")
 
 

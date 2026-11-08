@@ -9,7 +9,7 @@ from discord.ext import commands
 
 import store
 from cards import make_quote, make_banner, GOLD
-from core import team_only
+from core import team_only, modal_error
 
 log = logging.getLogger("bot")
 
@@ -61,6 +61,9 @@ class QuoteModal(discord.ui.Modal, title="Цитата"):
             return await i.followup.send("Не так быстро, подожди пару секунд.", ephemeral=True)
         await cog.post_quote(i.channel, i.user, self.text.value.strip(), self.signature.value.strip() or None, "dark")
         await i.followup.send("Цитата отправлена.", ephemeral=True)
+
+    async def on_error(self, i: discord.Interaction, error: Exception):
+        await modal_error(i, error)
 
 
 class QuotePanelView(discord.ui.View):

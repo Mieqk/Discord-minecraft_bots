@@ -114,6 +114,19 @@ async def on_app_error(i: discord.Interaction, error: app_commands.AppCommandErr
         await i.response.send_message(msg, ephemeral=True)
 
 
+async def modal_error(i, error):
+    """Ошибка в форме: пишем в лог (и в канал логов) и отвечаем игроку, чтобы не висело «думает»."""
+    log.error("Ошибка формы", exc_info=(type(error), error, error.__traceback__))
+    msg = "Что-то пошло не так, попробуй ещё раз."
+    try:
+        if i.response.is_done():
+            await i.followup.send(msg, ephemeral=True)
+        else:
+            await i.response.send_message(msg, ephemeral=True)
+    except discord.HTTPException:
+        pass
+
+
 async def get_user(uid):
     try:
         return bot.get_user(uid) or await bot.fetch_user(uid)
