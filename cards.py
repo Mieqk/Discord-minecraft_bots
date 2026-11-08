@@ -42,7 +42,10 @@ def font(size):
             return ImageFont.truetype(p, size)
         except OSError:
             continue
-    return ImageFont.load_default()
+    try:
+        return ImageFont.load_default(size)  # Pillow >= 10.1: запасной шрифт нужного размера
+    except TypeError:
+        return ImageFont.load_default()
 
 
 def base(h, glow=(-120, None)):
@@ -80,7 +83,19 @@ def circle_avatar(data, size):
 
 
 def wrap(d, text, fnt, max_w, max_lines):
-    words, lines, cur = text.split(), [], ""
+    words, lines, cur = [], [], ""
+    for w in text.split():
+        while len(w) > 1 and d.textlength(w, font=fnt) > max_w:  # слово шире строки режем на куски
+            lo, hi = 1, len(w)
+            while lo < hi:
+                mid = (lo + hi + 1) // 2
+                if d.textlength(w[:mid], font=fnt) <= max_w:
+                    lo = mid
+                else:
+                    hi = mid - 1
+            words.append(w[:lo])
+            w = w[lo:]
+        words.append(w)
     for w in words:
         test = f"{cur} {w}".strip()
         if d.textlength(test, font=fnt) <= max_w:
@@ -186,6 +201,7 @@ REGULAR_CANDIDATES = [
 ]
 PEACH_TOP = (255, 214, 168)
 PEACH_BOTTOM = (255, 249, 242)
+MAX_BG_PIXELS = 8_000_000   # больше не распаковываем: хост с 256 МБ памяти не выдержит
 INK = (45, 28, 22)
 BROWN = (140, 98, 62)
 ORANGE_SOFT = (235, 170, 110)
@@ -216,9 +232,13 @@ def make_quote(text, handle, avatar=None, style="dark", background=None):
     bg = None
     if background:
         try:
-            bg = ImageOps.fit(Image.open(io.BytesIO(background)).convert("RGB"), (W, h), Image.LANCZOS).convert("RGBA")
+            im = Image.open(io.BytesIO(background))  # размер читается без полной распаковки
+            if im.width * im.height > MAX_BG_PIXELS:
+                raise ValueError("картинка слишком большая")  # маленький файл может распаковаться в сотни МБ
+            im.draft("RGB", (W * 2, h * 2))  # JPEG сразу распаковывается уменьшенным
+            bg = ImageOps.fit(im.convert("RGB"), (W, h), Image.LANCZOS).convert("RGBA")
         except Exception:
-            bg = None  # битая картинка - рисуем без неё
+            bg = None  # битая или слишком большая картинка - рисуем без неё
     if bg is not None:
         shade = Image.new("RGBA", (W, h), (0, 0, 0, 150))
         img = Image.alpha_composite(bg, shade)
