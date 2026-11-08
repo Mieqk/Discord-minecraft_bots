@@ -11,9 +11,9 @@ def test_commands_register(store):
         await b.bot.add_cog(Quotes(b.bot))
         names = {c.name for c in b.bot.tree.get_commands()}
         assert {"setup", "setup_roles", "settings", "panel_app", "panel_report", "panel_bug", "status", "stats",
-                "stats_user", "weekly_post", "queue", "ticket", "health", "quote", "quotes", "block", "unblock", "blocked", "access"} <= names
+                "stats_user", "weekly_post", "queue", "ticket", "health", "quote", "quotes", "block", "unblock", "blocked", "access", "quote_channel"} <= names
         menus = {c.name for c in b.bot.tree.get_commands(type=__import__("discord").AppCommandType.message)}
-        assert menus == {"Цитата", "Цитата (тёмная)"}
+        assert menus == {"Цитата", "Цитата (светлая)"}
         for c in b.bot.tree.get_commands():
             c.to_dict(b.bot.tree)  # описание команды валидно для Discord
         await b.bot.close()

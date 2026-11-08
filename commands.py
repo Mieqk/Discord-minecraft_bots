@@ -76,6 +76,7 @@ async def settings(i: discord.Interaction, mc_check: bool | None = None,
         f"Автозакрытие при молчании игрока: **{str(days) + ' дн.' if days else 'выкл'}**\n"
         f"Копия базы в канал логов: **{on(cfg.get('backup_discord', False))}**\n"
         f"Ошибки бота в канал логов: **{on(cfg.get('error_log', True))}**\n"
+        f"Канал автоцитат: **{('<#' + str(cfg['quote_channel_id']) + '>') if cfg.get('quote_channel_id') else 'выкл'}**\n"
         f"Вайтлист по RCON: **{on(cfg.get('whitelist', True))}** "
         f"({'RCON настроен' if rcon.config() else 'RCON не настроен на хосте'})", ephemeral=True)
 
